@@ -33,4 +33,26 @@ PYBIND11_MODULE(_core, m) {
             return result;
         },
         "Add two vectors using CUDA");
+    m.def(
+        "simulate_decompression",
+        [](py::array_t<uint8_t> input, uint64_t output_size) {
+            // Get array info
+            py::buffer_info in_info = input.request();
+
+            if (in_info.ndim != 1) {
+                throw std::runtime_error("Arrays must be 1D");
+            }
+
+            // Allocate output array
+            py::array_t<uint8_t> output = py::array_t<uint8_t>(output_size);
+            py::buffer_info out_info = output.request();
+
+            // Call the C++ wrapper which calls CUDA
+            simulate_decompression(static_cast<uint8_t *>(in_info.ptr),
+                                   static_cast<uint8_t *>(out_info.ptr),
+                                   in_info.size, output_size);
+
+            return output;
+        },
+        "Simulate decompression using CUDA");
 }
