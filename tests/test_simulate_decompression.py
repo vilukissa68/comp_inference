@@ -5,9 +5,16 @@ import time
 
 from comp_inference import _core
 
-GIGS = 5
-SIZE = int(GIGS * 1024**3)
-R = 0.66
+GIGS = 3
+SIZE = int(GIGS * 1024**3)  # Bytes
+R = 1.00
+# Approximate memory usage during operation
+APPROXIMATE_MEMORY = int(SIZE * (2 + R))
+MAX_MEMORY = 11200 * 1024**2  # 11.2 GB
+if APPROXIMATE_MEMORY > MAX_MEMORY:
+    raise MemoryError(
+        f"Approximate memory usage {APPROXIMATE_MEMORY / 1024**3:.2f} GB exceeds the limit of {MAX_MEMORY / 1024**3:.2f} GB."
+    )
 
 
 def generate_array_uint8(size):

@@ -11,6 +11,8 @@
         }                                                                      \
     }
 
+#define SHARED_MEM_SIZE 49152 // 48KB
+
 __global__ void addVectorsKernel(const float *a, const float *b, float *c,
                                  int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,25 +72,61 @@ void cuda_vector_add_impl(const float *a, const float *b, float *c, int n) {
     cudaFree(d_c);
 }
 
+// __global__ void simulate_decompression_kernel(const input_type *input,
+//                                               output_type *output,
+//                                               uint64_t input_size,
+//                                               uint64_t output_size) {
+//     uint64_t idx =
+//         uint64_t(blockIdx.x) * uint64_t(blockDim.x) + uint64_t(threadIdx.x);
+//     if (idx < output_size) {
+//         if (idx < input_size) {
+//             output[idx] = static_cast<output_type>(input[idx]) + 1;
+//         } else {
+//             output[idx] = 2;
+//         }
+//     }
+// }
+
 __global__ void simulate_decompression_kernel(const input_type *input,
                                               output_type *output,
                                               uint64_t input_size,
                                               uint64_t output_size) {
-    uint64_t idx =
-        uint64_t(blockIdx.x) * uint64_t(blockDim.x) + uint64_t(threadIdx.x);
-    if (idx < output_size) {
-        if (idx < input_size) {
-            output[idx] = static_cast<output_type>(input[idx]) + 1;
+    extern __shared__ output_type shared_mem[]; // dynamic shared memory
+
+    uint64_t globalIdx = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    int localIdx = threadIdx.x; // index within shared memory for this thread
+
+    // First, write into shared memory (if within valid bounds)
+    if (globalIdx < output_size) {
+        if (globalIdx < input_size) {
+            shared_mem[localIdx] =
+                static_cast<output_type>(input[globalIdx]) + 1;
         } else {
-            output[idx] = 2;
+            shared_mem[localIdx] = 2;
         }
+    } else {
+        // Optional: you could write a dummy, or nothing (but must not skip
+        // barrier mismatch) E.g. shared_mem[localIdx] = 0;
+    }
+
+    __syncthreads();
+
+    // Now copy from shared memory back to global
+    if (globalIdx < output_size) {
+        output[globalIdx] = shared_mem[localIdx];
     }
 }
 
 void cuda_simulate_decompression(const input_type *input, output_type *output,
                                  uint64_t input_size, uint64_t output_size) {
-    int deviceId = 0; // Change this if you want to use a different GPU
+
+    int deviceId = 1; // Change this if you want to use a different GPU
     CHECK_CUDA(cudaSetDevice(deviceId));
+
+    cudaEvent_t e2e_start, e2e_stop;
+    CHECK_CUDA(cudaEventCreate(&e2e_start));
+    CHECK_CUDA(cudaEventCreate(&e2e_stop));
+    CHECK_CUDA(cudaEventRecord(e2e_start));
 
     // Basic device checking
     int deviceCount;
@@ -106,10 +144,10 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     float memcpy_time_ms = 0.0f;
     float decomp_time_ms = 0.0f;
     cudaEvent_t memcpy_start, memcpy_stop, decomp_start, decomp_stop;
-    cudaEventCreate(&memcpy_start);
-    cudaEventCreate(&memcpy_stop);
-    cudaEventCreate(&decomp_start);
-    cudaEventCreate(&decomp_stop);
+    CHECK_CUDA(cudaEventCreate(&memcpy_start));
+    CHECK_CUDA(cudaEventCreate(&memcpy_stop));
+    CHECK_CUDA(cudaEventCreate(&decomp_start));
+    CHECK_CUDA(cudaEventCreate(&decomp_stop));
 
     CHECK_CUDA(cudaMalloc((void **)&d_input, input_size * sizeof(input_type)));
     CHECK_CUDA(
@@ -123,27 +161,54 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     cudaEventElapsedTime(&memcpy_time_ms, memcpy_start, memcpy_stop);
 
     // Kernel launch configuration
-    uint64_t threads_per_block = 256;
+    uint64_t threads_per_block = 512; // Start with a high number of threads
     uint64_t num_blocks =
         (output_size + threads_per_block - 1ULL) / threads_per_block;
-    printf("Launching kernel with %llu blocks, %llu threads\n", num_blocks,
-           threads_per_block);
+
+    int max_shared = 0;
+    cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlock,
+                           deviceId);
+    printf("Max shared per block = %d bytes\n", max_shared);
+
+    // compute the shared memory size (in bytes) per block
+    size_t bytes_shared = threads_per_block * sizeof(output_type);
+
+    if (bytes_shared > max_shared) {
+        printf("Requested shared memory per block (%zu bytes) exceeds device "
+               "maximum (%d bytes). Adjusting threads per block.\n",
+               bytes_shared, max_shared);
+        threads_per_block = max_shared / sizeof(output_type);
+        bytes_shared = threads_per_block * sizeof(output_type);
+        num_blocks =
+            (output_size + threads_per_block - 1ULL) / threads_per_block;
+    }
+
+    printf(
+        "Launching kernel with %llu blocks, %llu threads, %zu bytes shared\n",
+        (unsigned long long)num_blocks, (unsigned long long)threads_per_block,
+        bytes_shared);
 
     cudaEventRecord(decomp_start);
-    simulate_decompression_kernel<<<num_blocks, threads_per_block>>>(
-        d_input, d_output, input_size, output_size);
+    simulate_decompression_kernel<<<num_blocks, threads_per_block,
+                                    bytes_shared>>>(d_input, d_output,
+                                                    input_size, output_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Launch error: %s\n", cudaGetErrorString(err));
     }
 
     CHECK_CUDA(cudaDeviceSynchronize());
-    cudaEventRecord(decomp_stop);
-    cudaEventSynchronize(decomp_stop);
-    cudaEventElapsedTime(&decomp_time_ms, decomp_start, decomp_stop);
+    CHECK_CUDA(cudaEventRecord(decomp_stop));
+    CHECK_CUDA(cudaEventSynchronize(decomp_stop));
+    CHECK_CUDA(
+        cudaEventElapsedTime(&decomp_time_ms, decomp_start, decomp_stop));
 
     printf("Decompression kernel time: %f ms\n", decomp_time_ms);
     printf("Memory copy time: %f ms\n", memcpy_time_ms);
+    CHECK_CUDA(cudaEventDestroy(memcpy_start));
+    CHECK_CUDA(cudaEventDestroy(memcpy_stop));
+    CHECK_CUDA(cudaEventDestroy(decomp_start));
+    CHECK_CUDA(cudaEventDestroy(decomp_stop));
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("CUDA error: %s\n", cudaGetErrorString(err));
@@ -151,9 +216,28 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
         printf("Decompression kernel execution successful\n");
     }
 
+    cudaEvent_t copyback_start, copyback_stop;
+    float copyback_time_ms = 0.0f;
+    CHECK_CUDA(cudaEventCreate(&copyback_start));
+    CHECK_CUDA(cudaEventCreate(&copyback_stop));
+    CHECK_CUDA(cudaEventRecord(copyback_start));
     CHECK_CUDA(cudaMemcpy(output, d_output, output_size * sizeof(output_type),
                           cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaEventRecord(copyback_stop));
+    CHECK_CUDA(cudaEventSynchronize(copyback_stop));
+    CHECK_CUDA(
+        cudaEventElapsedTime(&copyback_time_ms, copyback_start, copyback_stop));
+    printf("Copy back time: %f ms\n", copyback_time_ms);
 
-    cudaFree(d_input);
-    cudaFree(d_output);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaEventRecord(e2e_stop));
+    CHECK_CUDA(cudaEventSynchronize(e2e_stop));
+    float e2e_time_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&e2e_time_ms, e2e_start, e2e_stop));
+    printf("Total E2E time: %f ms\n", e2e_time_ms);
+    CHECK_CUDA(cudaEventDestroy(e2e_start));
+    CHECK_CUDA(cudaEventDestroy(e2e_stop));
+
+    CHECK_CUDA(cudaFree(d_input));
+    CHECK_CUDA(cudaFree(d_output));
 }
