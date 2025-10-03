@@ -1,5 +1,7 @@
 #include "kernels.cuh"
 #include <stdio.h>
+#include <stdlib.h>
+#include <cassert>
 
 #define CHECK_CUDA(call)                                                       \
     {                                                                          \
@@ -117,6 +119,28 @@ __global__ void simulate_decompression_kernel(const input_type *input,
     }
 }
 
+__global__ void simulate_decompression_kernel_output_bound(const input_type *input,
+                                              output_type *output,
+                                              uint64_t input_size,
+                                              uint64_t output_size) {
+	// NOTE: This kernel assumes threads launched == output_size
+    extern __shared__ output_type shared_mem[]; // dynamic shared memory
+
+    uint64_t globalIdx = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    int localIdx = threadIdx.x; // index within shared memory for this thread
+
+	if (globalIdx < input_size) {
+		shared_mem[localIdx] =
+			static_cast<output_type>(input[globalIdx]) + 1;
+	} else {
+		shared_mem[localIdx] = 2;
+	}
+
+	__syncthreads();
+
+    output[globalIdx] = shared_mem[localIdx];
+}
+
 void cuda_simulate_decompression(const input_type *input, output_type *output,
                                  uint64_t input_size, uint64_t output_size) {
 
@@ -161,7 +185,7 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     cudaEventElapsedTime(&memcpy_time_ms, memcpy_start, memcpy_stop);
 
     // Kernel launch configuration
-    uint64_t threads_per_block = 512; // Start with a high number of threads
+    uint64_t threads_per_block = 256; // Start with a high number of threads
     uint64_t num_blocks =
         (output_size + threads_per_block - 1ULL) / threads_per_block;
 
@@ -189,9 +213,14 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
         bytes_shared);
 
     cudaEventRecord(decomp_start);
-    simulate_decompression_kernel<<<num_blocks, threads_per_block,
-                                    bytes_shared>>>(d_input, d_output,
-                                                    input_size, output_size);
+    // simulate_decompression_kernel<<<num_blocks, threads_per_block,
+    //                                 bytes_shared>>>(d_input, d_output,
+    //                                                 input_size, output_size);
+    
+
+	assert(num_blocks * threads_per_block == output_size && "Threads launched must equal output size for this kernel");
+	simulate_decompression_kernel_output_bound<<<num_blocks, threads_per_block, bytes_shared>>>(d_input, d_output,
+												input_size, output_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Launch error: %s\n", cudaGetErrorString(err));
