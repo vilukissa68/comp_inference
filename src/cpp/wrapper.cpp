@@ -3,7 +3,13 @@
 
 void cuda_vector_add(const float *a, const float *b, float *c, int n) {
     std::cout << "In C++ wrapper function" << std::endl;
+#if defined(USE_CUDA) && USE_CUDA
     cuda_vector_add_impl(a, b, c, n);
+#else
+    std::cerr << "CUDA is not enabled. Cannot perform vector addition."
+              << std::endl;
+#endif
+
     std::cout << "Exiting C++ wrapper function" << std::endl;
 }
 
@@ -13,7 +19,12 @@ void simulate_decompression(const input_type *input, output_type *output,
               << std::endl;
     std::cout << "Input size: " << input_size
               << ", Output size: " << output_size << std::endl;
+#if defined(USE_CUDA) && USE_CUDA
     cuda_simulate_decompression(input, output, input_size, output_size);
+#else
+    std::cerr << "CUDA is not enabled. Cannot perform decompression."
+              << std::endl;
+#endif
 
     std::cout << "Exiting decompression simulation" << std::endl;
 }
