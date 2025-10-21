@@ -65,4 +65,48 @@ def replace_layer_norm_with_compressed(module: nn.Module) -> nn.Module:
             setattr(module, name, new_layer)
         else:
             replace_layer_norm_with_compressed(child)
+    return module                                                         
+
+def replace_all_with_compressed(module: nn.Module) -> nn.Module:          
+    """
+    Recursively replace all supported layers in a model with their compressed equivalents.
+    Supported layers: Linear, Embedding, LayerNorm
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            new_layer = CompressedLinear(
+                child.in_features, child.out_features, bias=(child.bias is not None)
+            )
+            new_layer.weight.data.copy_(child.weight.data)
+            if child.bias is not None:
+                new_layer.bias.data.copy_(child.bias.data)
+            setattr(module, name, new_layer)
+
+        elif isinstance(child, nn.Embedding):
+            new_layer = CompressedEmbedding(
+                num_embeddings=child.num_embeddings,
+                embedding_dim=child.embedding_dim,
+                padding_idx=child.padding_idx,
+                #max_norm=child.max_norm,
+                #norm_type=child.norm_type,
+                #scale_grad_by_freq=child.scale_grad_by_freq,
+                #sparse=child.sparse,
+            )
+            new_layer.weight.data.copy_(child.weight.data)
+            setattr(module, name, new_layer)
+
+        elif isinstance(child, nn.LayerNorm):
+            new_layer = CompressedLayerNorm(
+                normalized_shape=child.normalized_shape,
+                eps=child.eps,
+                elementwise_affine=child.elementwise_affine,
+            )
+            if child.elementwise_affine:
+                new_layer.weight.data.copy_(child.weight.data)
+                new_layer.bias.data.copy_(child.bias.data)
+            setattr(module, name, new_layer)
+
+        else:
+            replace_all_with_compressed(child)
+
     return module
