@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional
+from ..encoders.ans import ANSCompressor
 
 
 class CompressedLayerNorm(nn.Module):
@@ -28,38 +29,41 @@ class CompressedLayerNorm(nn.Module):
 
         self.register_buffer("compressed_weight", None)
         self.register_buffer("compressed_bias", None)
-        self.scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
+        self.encoder = ANSCompressor()
 
     def compress(self):
-        """Quantize weight and bias to int8 / float16"""
+        """Compress weights and biases with chosen encoder"""
         if not self.elementwise_affine:
             return
 
         with torch.no_grad():
-            w = self.weight
-            scale = w.abs().max() / 127
-            q_w = torch.clamp((w / scale).round(), -128, 127).to(torch.int8)
-
-            self.compressed_weight = q_w
-            self.scale.data = torch.tensor(scale, device=w.device)
+            self.compressed_weight = self.encoder.encode(self.weight)
 
             if self.bias is not None:
-                self.compressed_bias = self.bias.to(torch.float16)
+                self.compressed_bias = self.encoder.encode(self.bias)
 
             del self._parameters["weight"]
             if self.bias is not None:
                 del self._parameters["bias"]
 
     def decompress(self):
-        """Dequantize back to float32"""
+        """Decompress weights and biases with chosen encoder"""
         if self.compressed_weight is None:
             return
 
         with torch.no_grad():
-            w = self.compressed_weight.float() * self.scale
+            w = self.encoder.decode(
+                self.compressed_weight,
+                dtype=torch.float32,  # TODO: make dtype configurable
+                shape=self.normalized_shape,
+            )
             self.weight = nn.Parameter(w)
             if self.compressed_bias is not None:
-                self.bias = nn.Parameter(self.compressed_bias.float())
+                self.bias = self.encoder.decode(
+                    self.compressed_bias,
+                    dtype=torch.float32,  # TODO: make dtype configurable
+                    shape=self.normalized_shape,
+                )
 
             self.compressed_weight = None
             self.compressed_bias = None

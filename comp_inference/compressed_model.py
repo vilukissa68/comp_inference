@@ -23,9 +23,6 @@ class CompressedModel(nn.Module):
         """
         super().__init__()
         self.model = model
-        print("CompressedModel: compress_linear =", compress_linear)
-        print("CompressedModel: compress_embedding =", compress_embedding)
-        print("CompressedModel: compress_layer_norm =", compress_layer_norm)
         self.compress_linear = compress_linear
         self.compress_embedding = compress_embedding
         self.compress_layer_norm = compress_layer_norm
@@ -74,6 +71,7 @@ class CompressedModel(nn.Module):
 
     def compress(self):
         """Compress all supported layers."""
+        print("Compressing model...")
         for layer in self.model.modules():
             if hasattr(layer, "compress"):
                 print("Compressing layer:", layer)
@@ -81,6 +79,7 @@ class CompressedModel(nn.Module):
 
     def decompress(self):
         """Decompress all supported layers."""
+        print("Decompressing model...")
         for layer in self.model.modules():
             if hasattr(layer, "decompress"):
                 print("Decompressing layer:", layer)
@@ -91,12 +90,16 @@ class CompressedModel(nn.Module):
         Forward pass: decompress layers on the fly if compressed.
         """
         # Decompress layers temporarily if needed
+        print("Forward pass:")
         for layer in self.model.modules():
             if (
                 hasattr(layer, "compressed_weight")
                 and layer.compressed_weight is not None
             ):
+                print("Decompressing layer for forward:", layer)
                 layer.decompress()
+            else:
+                print("Layer is uncompressed:", layer)
 
         return self.model(*args, **kwargs)
 

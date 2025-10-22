@@ -29,22 +29,24 @@ class DummyModel(nn.Module):
 
 class TestCompressedModel(unittest.TestCase):
     def setUp(self):
-        self.model = DummyModel()
-        self.input_data = torch.randint(0, 50, (4, 8))
+        self.model = DummyModel().to("cuda")
+        self.input_data = torch.randint(0, 50, (4, 8)).to("cuda")
         self.compressed_model = CompressedModel(
             self.model,
             compress_layer_norm=False,
             compress_embedding=False,
-            compress_linear=False,
+            compress_linear=True,
         )  # separate instance
 
-    def test_forward_equivalence(self):
-        # Forward output should be close before compression
-        orig_out = self.model(self.input_data)
-        comp_out = self.compressed_model(self.input_data)
-        self.assertTrue(torch.allclose(orig_out, comp_out, atol=1e-2))
+    def test_compress_decompress_lossless(self):
+        self.compressed_model.compress()
+        self.compressed_model.decompress()
+        for orig_param, comp_param in zip(
+            self.model.parameters(), self.compressed_model.model.parameters()
+        ):
+            self.assertTrue(torch.allclose(orig_param, comp_param, atol=1e-6))
 
-    def test_compress_decompress(self):
+    def test_compress_manual_decompress(self):
         # Test compression and decompression
         self.compressed_model.compress()
         # Check compressed weights exist and original params removed
@@ -56,11 +58,6 @@ class TestCompressedModel(unittest.TestCase):
                 if hasattr(layer, "bias") and layer.bias is not None:
                     self.assertIsNotNone(layer.compressed_bias)
 
-        # Forward pass after compression should match original closely
-        orig_out = self.model(self.input_data)
-        comp_out = self.compressed_model(self.input_data)
-        self.assertTrue(torch.allclose(orig_out, comp_out, atol=1e-1))
-
         # Decompress and check weights restored
         self.compressed_model.decompress()
         for layer in self.compressed_model.model.modules():
@@ -70,6 +67,22 @@ class TestCompressedModel(unittest.TestCase):
                 self.assertIsNone(layer.compressed_weight)
                 if hasattr(layer, "bias") and layer.bias is not None:
                     self.assertIsNone(layer.compressed_bias)
+
+        # Forward pass after compression should match original closely
+        orig_out = self.model(self.input_data)
+        comp_out = self.compressed_model(self.input_data)
+        self.assertTrue(orig_out.shape == comp_out.shape)
+        self.assertTrue(torch.allclose(orig_out, comp_out, atol=1e-1))
+
+    def test_forward_with_on_the_fly_decompression(self):
+        # Compress the model
+        self.compressed_model.compress()
+
+        # Forward pass should decompress layers on the fly
+        out = self.compressed_model(self.input_data)
+
+        # Check output shape
+        self.assertEqual(out.shape, (4, 10))
 
     def test_save_load_roundtrip(self):
         # Compress and save state

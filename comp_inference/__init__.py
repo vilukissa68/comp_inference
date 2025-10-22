@@ -10,6 +10,7 @@ from .layers.compressed_linear import CompressedLinear
 from .layers.compressed_embedding import CompressedEmbedding
 from .layers.compressed_layer_norm import CompressedLayerNorm
 from .compressed_model import CompressedModel
+from .encoders.ans import ANSCompressor
 
 __all__ = [
     "replace_linear_with_compressed",
