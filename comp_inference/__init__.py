@@ -9,6 +9,7 @@ from .comp_infernece import (
 from .layers.compressed_linear import CompressedLinear
 from .layers.compressed_embedding import CompressedEmbedding
 from .layers.compressed_layer_norm import CompressedLayerNorm
+from .compressed_model import CompressedModel
 
 __all__ = [
     "replace_linear_with_compressed",

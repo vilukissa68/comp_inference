@@ -19,15 +19,6 @@ class CompressedLinear(nn.Module):
         self.register_buffer("compressed_weight", None)
         self.register_buffer("compressed_bias", None)
 
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / fan_in**0.5
-            nn.init.uniform_(self.bias, -bound, bound)
-
     def compress(self):
         """Compress weights and bias"""
         with torch.no_grad():

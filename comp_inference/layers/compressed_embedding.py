@@ -22,14 +22,6 @@ class CompressedEmbedding(nn.Module):
         # Store compressed form
         self.register_buffer("compressed_weight", None)
 
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.normal_(self.weight, mean=0, std=self.embedding_dim**-0.5)
-        if self.padding_idx is not None:
-            with torch.no_grad():
-                self.weight[self.padding_idx].zero_()
-
     def compress(self):
         """Compress embedding weight."""
         with torch.no_grad():
