@@ -12,7 +12,7 @@ __global__ void simulate_decompression_kernel(const input_type *input,
 
 // Host function that manages memory and launches the kernel
 void cuda_vector_add_impl(const float *a, const float *b, float *c, int n);
-void cuda_simulate_decompression(const input_type *input, output_type *output,
+float cuda_simulate_decompression(const input_type *input, output_type *output,
                                  uint64_t input_size, uint64_t output_size);
 
 #endif // KERNELS_CUH

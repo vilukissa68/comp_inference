@@ -48,11 +48,12 @@ PYBIND11_MODULE(_core, m) {
             py::buffer_info out_info = output.request();
 
             // Call the C++ wrapper which calls CUDA
-            simulate_decompression(static_cast<uint8_t *>(in_info.ptr),
+            float decomp_time_ms = simulate_decompression(static_cast<uint8_t *>(in_info.ptr),
                                    static_cast<uint8_t *>(out_info.ptr),
                                    in_info.size, output_size);
 
-            return output;
+            return py::make_tuple(output, decomp_time_ms);
         },
         "Simulate decompression using CUDA");
+
 }

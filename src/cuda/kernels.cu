@@ -119,10 +119,11 @@ __global__ void simulate_decompression_kernel(const input_type *input,
     }
 }
 
-__global__ void simulate_decompression_kernel_output_bound(
-    const input_type *input, output_type *output, uint64_t input_size,
-    uint64_t output_size) {
-    // NOTE: This kernel assumes threads launched == output_size
+__global__ void simulate_decompression_kernel_output_bound(const input_type * __restrict__ input,
+                                              output_type * __restrict__ output,
+                                              uint64_t input_size,
+                                              uint64_t output_size) {
+	// NOTE: This kernel assumes threads launched == output_size
     extern __shared__ output_type shared_mem[]; // dynamic shared memory
 
     uint64_t globalIdx = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -134,12 +135,14 @@ __global__ void simulate_decompression_kernel_output_bound(
         shared_mem[localIdx] = 2;
     }
 
-    __syncthreads();
+	//__syncthreads();
 
     output[globalIdx] = shared_mem[localIdx];
 }
 
-void cuda_simulate_decompression(const input_type *input, output_type *output,
+
+
+float cuda_simulate_decompression(const input_type * __restrict__ input, output_type * __restrict__ output,
                                  uint64_t input_size, uint64_t output_size) {
 
     int deviceId = 1; // Change this if you want to use a different GPU
@@ -149,15 +152,6 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     CHECK_CUDA(cudaEventCreate(&e2e_start));
     CHECK_CUDA(cudaEventCreate(&e2e_stop));
     CHECK_CUDA(cudaEventRecord(e2e_start));
-
-    // Basic device checking
-    int deviceCount;
-    CHECK_CUDA(cudaGetDeviceCount(&deviceCount));
-    printf("Device count: %d\n", deviceCount);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, deviceId);
-    printf("maxGridDimX = %d, maxGridDimY = %d, maxGridDimZ = %d\n",
-           prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
 
     // Allocate device memory
     input_type *d_input = nullptr;
@@ -183,14 +177,13 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     cudaEventElapsedTime(&memcpy_time_ms, memcpy_start, memcpy_stop);
 
     // Kernel launch configuration
-    uint64_t threads_per_block = 256; // Start with a high number of threads
+    uint64_t threads_per_block = 512; // Start with a high number of threads
     uint64_t num_blocks =
         (output_size + threads_per_block - 1ULL) / threads_per_block;
 
     int max_shared = 0;
     cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlock,
                            deviceId);
-    printf("Max shared per block = %d bytes\n", max_shared);
 
     // compute the shared memory size (in bytes) per block
     size_t bytes_shared = threads_per_block * sizeof(output_type);
@@ -215,11 +208,9 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     //                                 bytes_shared>>>(d_input, d_output,
     //                                                 input_size, output_size);
 
-    assert(num_blocks * threads_per_block == output_size &&
-           "Threads launched must equal output size for this kernel");
-    simulate_decompression_kernel_output_bound<<<num_blocks, threads_per_block,
-                                                 bytes_shared>>>(
-        d_input, d_output, input_size, output_size);
+	assert(num_blocks * threads_per_block == output_size && "Threads launched must equal output size for this kernel");
+	simulate_decompression_kernel_output_bound<<<num_blocks, threads_per_block, bytes_shared>>>(d_input, d_output,
+												input_size, output_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Launch error: %s\n", cudaGetErrorString(err));
@@ -231,6 +222,8 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
     CHECK_CUDA(
         cudaEventElapsedTime(&decomp_time_ms, decomp_start, decomp_stop));
 
+	float troughput = float(input_size + output_size) / (decomp_time_ms / 1000.0f) / 1e9f;
+	printf("Throughput: %f GB/s\n", troughput);
     printf("Decompression kernel time: %f ms\n", decomp_time_ms);
     printf("Memory copy time: %f ms\n", memcpy_time_ms);
     CHECK_CUDA(cudaEventDestroy(memcpy_start));
@@ -268,4 +261,6 @@ void cuda_simulate_decompression(const input_type *input, output_type *output,
 
     CHECK_CUDA(cudaFree(d_input));
     CHECK_CUDA(cudaFree(d_output));
+	return decomp_time_ms;
 }
+

@@ -13,18 +13,18 @@ void cuda_vector_add(const float *a, const float *b, float *c, int n) {
     std::cout << "Exiting C++ wrapper function" << std::endl;
 }
 
-void simulate_decompression(const input_type *input, output_type *output,
+float simulate_decompression(const input_type *input, output_type *output,
                             uint64_t input_size, uint64_t output_size) {
     std::cout << "Simulating decompression in C++ wrapper function"
               << std::endl;
     std::cout << "Input size: " << input_size
               << ", Output size: " << output_size << std::endl;
 #if defined(USE_CUDA) && USE_CUDA
-    cuda_simulate_decompression(input, output, input_size, output_size);
+    float decomp_time_ms = cuda_simulate_decompression(input, output, input_size, output_size);
 #else
-    std::cerr << "CUDA is not enabled. Cannot perform decompression."
-              << std::endl;
+    std::cerr << "CUDA is not enabled. Cannot perform decompression." << std::endl;
 #endif
-
     std::cout << "Exiting decompression simulation" << std::endl;
+	return decomp_time_ms;
 }
+
