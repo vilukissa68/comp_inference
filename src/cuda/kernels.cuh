@@ -3,6 +3,9 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+typedef uint8_t output_type;
+typedef uint8_t input_type;
+
 // Kernel declaration
 __global__ void addVectorsKernel(const float *a, const float *b, float *c,
                                  int n);

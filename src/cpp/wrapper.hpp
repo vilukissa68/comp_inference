@@ -1,14 +1,15 @@
 #ifndef WRAPPER_H_
 #define WRAPPER_H_
 
+#include <cstdint>
 // Include the CUDA header only if CUDA is enabled
 #if defined(USE_CUDA) && USE_CUDA
 #include "../cuda/kernels.cuh"
-#endif
-
-#include <cstdint>
+#else
 typedef uint8_t output_type;
 typedef uint8_t input_type;
+#endif
+
 
 // C++ wrapper function that will call the CUDA implementation
 void cuda_vector_add(const float *a, const float *b, float *c, int n);

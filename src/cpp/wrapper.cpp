@@ -1,6 +1,8 @@
 #include "wrapper.hpp"
 #include <iostream>
 
+
+
 void cuda_vector_add(const float *a, const float *b, float *c, int n) {
     std::cout << "In C++ wrapper function" << std::endl;
 #if defined(USE_CUDA) && USE_CUDA
@@ -27,4 +29,3 @@ float simulate_decompression(const input_type *input, output_type *output,
     std::cout << "Exiting decompression simulation" << std::endl;
 	return decomp_time_ms;
 }
-
