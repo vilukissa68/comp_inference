@@ -33,7 +33,10 @@ class CompressedModel(nn.Module):
             # Replace Linear
             if isinstance(child, nn.Linear) and self.compress_linear:
                 new_layer = CompressedLinear(
-                    child.in_features, child.out_features, bias=(child.bias is not None)
+                    child.in_features,
+                    child.out_features,
+                    bias=(child.bias is not None),
+                    dtype=child.weight.dtype,
                 )
                 new_layer.weight.data.copy_(child.weight.data)
                 if child.bias is not None:
@@ -71,18 +74,14 @@ class CompressedModel(nn.Module):
 
     def compress(self):
         """Compress all supported layers."""
-        print("Compressing model...")
         for layer in self.model.modules():
             if hasattr(layer, "compress"):
-                print("Compressing layer:", layer)
                 layer.compress()
 
     def decompress(self):
         """Decompress all supported layers."""
-        print("Decompressing model...")
         for layer in self.model.modules():
             if hasattr(layer, "decompress"):
-                print("Decompressing layer:", layer)
                 layer.decompress()
 
     def forward(self, *args, **kwargs):
@@ -90,56 +89,51 @@ class CompressedModel(nn.Module):
         Forward pass: decompress layers on the fly if compressed.
         """
         # Decompress layers temporarily if needed
-        print("Forward pass:")
         for layer in self.model.modules():
             if (
                 hasattr(layer, "compressed_weight")
                 and layer.compressed_weight is not None
             ):
-                print("Decompressing layer for forward:", layer)
                 layer.decompress()
-            else:
-                print("Layer is uncompressed:", layer)
 
         return self.model(*args, **kwargs)
 
-    def state_dict(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
-        """
-        Save only compressed weights to reduce size.
-        """
+    def state_dict(self):
         state = {}
         for name, layer in self.model.named_modules():
-            if (
-                hasattr(layer, "compressed_weight")
-                and layer.compressed_weight is not None
-            ):
-                state[f"{name}.weight"] = layer.compressed_weight
-                if (
-                    hasattr(layer, "compressed_bias")
-                    and layer.compressed_bias is not None
-                ):
-                    state[f"{name}.bias"] = layer.compressed_bias
-            elif isinstance(layer, (nn.Linear, nn.Embedding, nn.LayerNorm)):
-                # Uncompressed fallback
+            # skip containers
+            if len(list(layer.children())) > 0:
+                continue
+
+            # Save compressed buffers if present
+            if getattr(layer, "compressed_weight", None) is not None:
+                state[f"{name}.compressed_weight"] = layer.compressed_weight
+                state[f"{name}.weight_dtype"] = layer.weight_dtype
+            elif hasattr(layer, "weight"):
                 state[f"{name}.weight"] = layer.weight.data
-                if getattr(layer, "bias", None) is not None:
-                    state[f"{name}.bias"] = layer.bias.data
+
+            if getattr(layer, "compressed_bias", None) is not None:
+                state[f"{name}.compressed_bias"] = layer.compressed_bias
+                state[f"{name}.bias_dtype"] = layer.bias_dtype
+            elif hasattr(layer, "bias") and layer.bias is not None:
+                state[f"{name}.bias"] = layer.bias.data
+
         return state
 
-    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
-        """
-        Load compressed weights back into the model.
-        """
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor]):
         for name, layer in self.model.named_modules():
-            weight_key = f"{name}.weight"
-            bias_key = f"{name}.bias"
-            if weight_key in state_dict:
-                if hasattr(layer, "compressed_weight"):
-                    layer.compressed_weight = state_dict[weight_key]
-                else:
-                    layer.weight.data.copy_(state_dict[weight_key])
-            if bias_key in state_dict:
-                if hasattr(layer, "compressed_bias"):
-                    layer.compressed_bias = state_dict[bias_key]
-                else:
-                    layer.bias.data.copy_(state_dict[bias_key])
+            if len(list(layer.children())) > 0:
+                continue
+
+            # Load compressed buffers first
+            if f"{name}.compressed_weight" in state_dict:
+                layer.compressed_weight = state_dict[f"{name}.compressed_weight"]
+                layer.weight_dtype = state_dict[f"{name}.weight_dtype"]
+            elif f"{name}.weight" in state_dict:
+                layer.weight.data.copy_(state_dict[f"{name}.weight"])
+
+            if f"{name}.compressed_bias" in state_dict:
+                layer.compressed_bias = state_dict[f"{name}.compressed_bias"]
+                layer.bias_dtype = state_dict[f"{name}.bias_dtype"]
+            elif f"{name}.bias" in state_dict and layer.bias is not None:
+                layer.bias.data.copy_(state_dict[f"{name}.bias"])
