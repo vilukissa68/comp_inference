@@ -8,6 +8,8 @@ from comp_inference.layers.compressed_embedding import CompressedEmbedding
 from comp_inference.layers.compressed_layer_norm import CompressedLayerNorm
 from typing import Optional, Dict
 
+from .utils.tied_embeddings import has_tied_embeddings
+
 
 class CompressedModel(nn.Module):
     def __init__(
@@ -26,9 +28,12 @@ class CompressedModel(nn.Module):
         self.compress_linear = compress_linear
         self.compress_embedding = compress_embedding
         self.compress_layer_norm = compress_layer_norm
+        self.has_tied_embeddings = has_tied_embeddings(self.model)
         self._replace_all_layers(self.model)
 
-    def _replace_all_layers(self, module: nn.Module):
+    def _replace_all_layers(
+        self, module: nn.Module, shared_map: Optional[Dict[int, nn.Module]] = None
+    ):
         for name, child in module.named_children():
             # Replace Linear
             if isinstance(child, nn.Linear) and self.compress_linear:
@@ -49,10 +54,7 @@ class CompressedModel(nn.Module):
                     num_embeddings=child.num_embeddings,
                     embedding_dim=child.embedding_dim,
                     padding_idx=child.padding_idx,
-                    # max_norm=child.max_norm,
-                    # norm_type=child.norm_type,
-                    # scale_grad_by_freq=child.scale_grad_by_freq,
-                    # sparse=child.sparse,
+                    dtype=child.weight.dtype,
                 )
                 new_layer.weight.data.copy_(child.weight.data)
                 setattr(module, name, new_layer)
@@ -77,18 +79,46 @@ class CompressedModel(nn.Module):
         for layer in self.model.modules():
             if hasattr(layer, "compress"):
                 layer.compress()
+        return self
 
     def decompress(self):
         """Decompress all supported layers."""
         for layer in self.model.modules():
             if hasattr(layer, "decompress"):
                 layer.decompress()
+        return self
+
+    def size_in_bytes(self) -> int:
+        """Calculate total size of all unique (compressed or regular) weights in bytes."""
+        total_size = 0
+
+        for name, layer in self.model.named_modules():
+            # Weight (compressed or not)
+            if (
+                hasattr(layer, "compressed_weight")
+                and layer.compressed_weight is not None
+            ):
+                w = layer.compressed_weight
+                total_size += w.element_size() * w.nelement()
+            elif hasattr(layer, "weight"):
+                w = layer.weight
+                if w is not None:
+                    total_size += w.element_size() * w.nelement()
+
+            # Bias (compressed or not)
+            if hasattr(layer, "compressed_bias") and layer.compressed_bias is not None:
+                b = layer.compressed_bias
+                total_size += b.element_size() * b.nelement()
+            elif hasattr(layer, "bias") and layer.bias is not None:
+                b = layer.bias
+                total_size += b.element_size() * b.nelement()
+
+        return total_size
 
     def forward(self, *args, **kwargs):
         """
         Forward pass: decompress layers on the fly if compressed.
         """
-        # Decompress layers temporarily if needed
         for layer in self.model.modules():
             if (
                 hasattr(layer, "compressed_weight")
@@ -101,6 +131,8 @@ class CompressedModel(nn.Module):
     def state_dict(self):
         state = {}
         for name, layer in self.model.named_modules():
+
+            print(f"Saving state for layer: {name}")
             # skip containers
             if len(list(layer.children())) > 0:
                 continue
@@ -125,6 +157,8 @@ class CompressedModel(nn.Module):
             if len(list(layer.children())) > 0:
                 continue
 
+            print(f"Loading state for layer: {name}")
+
             # Load compressed buffers first
             if f"{name}.compressed_weight" in state_dict:
                 layer.compressed_weight = state_dict[f"{name}.compressed_weight"]
@@ -137,3 +171,9 @@ class CompressedModel(nn.Module):
                 layer.bias_dtype = state_dict[f"{name}.bias_dtype"]
             elif f"{name}.bias" in state_dict and layer.bias is not None:
                 layer.bias.data.copy_(state_dict[f"{name}.bias"])
+
+    def __getattr__(self, name):
+        # Delegate attribute access to the model when not found in wrapper
+        if name == "model":  # Prevent recursion
+            return super().__getattr__(name)
+        return getattr(self.model, name)

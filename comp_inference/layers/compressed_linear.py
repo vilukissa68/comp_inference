@@ -7,6 +7,7 @@ from typing import Optional
 
 from ..encoders.ans import ANSCompressor
 from ..utils.dtype_enum import DTypeEnum, DTYPE_TO_ENUM, ENUM_TO_DTYPE
+import comp_inference._core as core
 
 
 class CompressedLinear(nn.Module):
@@ -38,7 +39,7 @@ class CompressedLinear(nn.Module):
             torch.tensor(DTYPE_TO_ENUM[self.weight.dtype], dtype=torch.int8),
             persistent=True,
         )
-        if bias is not None:
+        if self.bias is not None:
             self.register_buffer(
                 "bias_dtype",
                 torch.tensor(DTYPE_TO_ENUM[self.bias.dtype], dtype=torch.int8),
@@ -70,6 +71,7 @@ class CompressedLinear(nn.Module):
             del self._parameters["weight"]
             if self.bias is not None:
                 del self._parameters["bias"]
+            torch.cuda.empty_cache()
 
     def decompress(self):
         """Restore the full-precision weights from the compressed form."""
@@ -92,7 +94,6 @@ class CompressedLinear(nn.Module):
                     )
                 )
 
-            # Free compressed form if not needed
             self.compressed_weight = None
             self.compressed_bias = None
 
@@ -106,4 +107,19 @@ class CompressedLinear(nn.Module):
             self.weight.device,
             None if self.bias is None else self.bias.device,
         )
-        return F.linear(x, self.weight, self.bias)
+        # return F.linear(x, self.weight, self.bias)
+        # becomes
+        if self.bias is None:
+            bias = torch.zeros(
+                self.out_features, device=x.device, dtype=self.weight.dtype
+            )
+        else:
+            bias = self.bias
+        output = core.linear_forward(
+            x,
+            torch.as_tensor(self.weight),
+            torch.as_tensor(bias),
+        )
+        print(output)
+
+        return output

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 
 import unittest
+import torch
 from comp_inference import CompressedModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Use cuda device 1
+torch.cuda.set_device(0)
 
 
 class TestFullModelCompression(unittest.TestCase):
@@ -16,12 +21,15 @@ class TestFullModelCompression(unittest.TestCase):
         gt_output = None
         comp_output = None
 
+        device_map = {"": "cuda:0"}
+
         # Load model
         model_name = "Qwen/Qwen3-0.6B"
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            cache_dir=None,
             torch_dtype=data_type,
-            device_map="auto",
+            device_map=device_map,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
@@ -42,14 +50,15 @@ class TestFullModelCompression(unittest.TestCase):
         compressed_model = CompressedModel(
             model,
             compress_layer_norm=False,
-            compress_embedding=False,
+            compress_embedding=True,
             compress_linear=True,
         )
+        size_uncompressed = compressed_model.size_in_bytes()
+        compressed_model = compressed_model.compress()
+        size_compressed = compressed_model.size_in_bytes()
 
         # Get compressed model output
-        inputs = tokenizer(input_text, return_tensors="pt").to(
-            next(compressed_model.parameters()).device
-        )
+        inputs = tokenizer(input_text, return_tensors="pt").to("cuda:0")
 
         with torch.no_grad():
             comp_output = compressed_model.generate(
@@ -59,6 +68,10 @@ class TestFullModelCompression(unittest.TestCase):
                 temperature=0.0,
                 top_p=0.95,
             )
+
+        print(
+            f"Model size: uncompressed = {size_uncompressed/1e6:.2f} MB, compressed = {size_compressed/1e6:.2f} MB, compression ratio = {size_compressed/size_uncompressed:.2f}x"
+        )
 
         # Decode outputs and validate equality
         gt_text = tokenizer.decode(gt_output[0], skip_special_tokens=True)

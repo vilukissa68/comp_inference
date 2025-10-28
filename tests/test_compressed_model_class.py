@@ -52,7 +52,7 @@ class TestCompressedModel(unittest.TestCase):
         self.compressed_model = CompressedModel(
             self.model,
             compress_layer_norm=False,
-            compress_embedding=False,
+            compress_embedding=True,
             compress_linear=True,
         )  # separate instance
 
@@ -124,11 +124,13 @@ class TestCompressedModel(unittest.TestCase):
         new_model = CompressedModel(
             DummyModel(),
             compress_layer_norm=False,
-            compress_embedding=False,
+            compress_embedding=True,
             compress_linear=True,
         ).to("cuda")
         print("-" * 20, "before loading state", "-" * 20)
         new_model.load_state_dict(state)
+
+        print(new_model)
 
         # Check outputs are still close
         print("-" * 20, "checking outputs", "-" * 20)

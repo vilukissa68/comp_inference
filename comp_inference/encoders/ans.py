@@ -5,7 +5,7 @@ import torch
 
 
 class ANSCompressor:
-    def __init__(self, algorithm="ANS", chunk_size=65536):
+    def __init__(self, algorithm="ANS", chunk_size=64 * 1024):
         self.chunk_size = chunk_size
         self.algorithm = algorithm
         self.codec = nvcomp.Codec(
