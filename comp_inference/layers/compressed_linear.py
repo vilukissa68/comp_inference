@@ -107,19 +107,37 @@ class CompressedLinear(nn.Module):
             self.weight.device,
             None if self.bias is None else self.bias.device,
         )
-        # return F.linear(x, self.weight, self.bias)
-        # becomes
+
+        print("Input:", x)
+        print("Weight:", self.weight)
+        print("Bias:", self.bias)
+
+        gt = F.linear(x, self.weight, self.bias)
+
         if self.bias is None:
             bias = torch.zeros(
                 self.out_features, device=x.device, dtype=self.weight.dtype
             )
         else:
             bias = self.bias
+
+        x_flat = x.reshape(
+            -1, x.shape[-1]
+        )  # shape: (batch_size * seq_len, in_features)
         output = core.linear_forward(
-            x,
+            x_flat,
             torch.as_tensor(self.weight),
             torch.as_tensor(bias),
         )
-        print(output)
+        if output.ndim == 2 and x.ndim == 3:
+            # expand to match batch dimensions
+            output = output.unsqueeze(1)
+        print("Ground truth:", gt)
+        print("Custom Linear:", output)
+
+        if torch.allclose(gt, output):
+            print("Outputs match!")
+        else:
+            print("Outputs do not match!")
 
         return output
