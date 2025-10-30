@@ -100,12 +100,13 @@ class CompressedLinear(nn.Module):
     def forward(self, x: torch.Tensor):
         if self.compressed_weight is not None:
             self.decompress()
+
         assert x.device == self.weight.device and (
             self.bias is None or x.device == self.bias.device
-        ), "Device mismatch in CompressedLinear forward. x.device: {}, weight.device: {}, bias.device: {}".format(
-            x.device,
-            self.weight.device,
-            None if self.bias is None else self.bias.device,
+        ), (
+            f"Device mismatch in CompressedLinear forward. "
+            f"x.device={x.device}, weight.device={self.weight.device}, "
+            f"bias.device={None if self.bias is None else self.bias.device}"
         )
 
         print("Input:", x)
@@ -121,17 +122,19 @@ class CompressedLinear(nn.Module):
         else:
             bias = self.bias
 
-        x_flat = x.reshape(
-            -1, x.shape[-1]
-        )  # shape: (batch_size * seq_len, in_features)
+        # Flatten (batch * seq_len, in_features)
+        x_flat = x.reshape(-1, x.shape[-1])
+
+        # Run custom CUDA kernel
         output = core.linear_forward(
             x_flat,
             torch.as_tensor(self.weight),
             torch.as_tensor(bias),
         )
-        if output.ndim == 2 and x.ndim == 3:
-            # expand to match batch dimensions
-            output = output.unsqueeze(1)
+
+        # Reshape back to (batch, seq_len, out_features)
+        output = output.view(x.shape[0], x.shape[1], -1)
+
         print("Ground truth:", gt)
         print("Custom Linear:", output)
 
