@@ -2,13 +2,13 @@
 #include <cuda.h>
 
 template <typename RansConfig>
-__global__ void rand_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
+__global__ void rans_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
 
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;
     using io_t = typename RansConfig::io_t;
 
-    uint32_t gid = blockGid.x * blockDim.x + threadGid.x;
+	uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= ctx.num_streams) {
         return;
     }
@@ -29,7 +29,7 @@ __global__ void rand_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
         // Too many threads launched
         // NOTE: This should be avoided with careful thread launching
         ctx.final_states[gid] = state;
-        ctx.steam_sizes[gid] = 0;
+        ctx.output_sizes[gid] = 0;
         return;
     }
 
@@ -78,4 +78,45 @@ __global__ void rand_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
 
     // Save number of values written
     ctx.output_sizes[gid] = out_idx;
+}
+
+template <typename RansConfig>
+__global__ void rans_decompress_kernel(RansDecoderCtx<RansConfig> ctx) {
+    using symbol_t = typename RansConfig::symbol_t;
+    using state_t = typename RansConfig::state_t;
+    using io_t = typename RansConfig::io_t;
+
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= ctx.num_streams) return;
+
+    // 1. INPUT SETUP
+    const io_t* stream_base = &ctx.input[gid * ctx.stream_capacity];
+    uint32_t stream_size = ctx.input_sizes[gid];
+    
+    // IMPORTANT: Read backwards from the end of the stream
+    int32_t stream_offset = (int32_t)stream_size - 1;
+
+    // 2. OUTPUT SETUP
+    uint32_t out_idx = gid;
+    uint32_t out_stride = ctx.num_streams;
+
+    state_t state = ctx.initial_states[gid];
+
+    for(uint32_t i = 0; i < ctx.output_size; i++) {
+        uint32_t slot = state & RansConfig::prob_mask;
+        symbol_t s = ctx.tables.slot_to_sym[slot];
+
+        ctx.output[out_idx] = s;
+        out_idx += out_stride;
+
+        auto info = ctx.tables.sym_info[s];
+        state = info.freq * (state >> RansConfig::prob_bits) + (slot - info.cdf);
+
+        // Renormalize
+        while (state < RansConfig::rans_l && stream_offset >= 0) {
+            io_t value = stream_base[stream_offset];
+            stream_offset--; // Move backwards
+            state = (state << RansConfig::io_bits) | value;
+        }
+    }
 }

@@ -3,6 +3,20 @@
 #include <stdint.h>
 #include <type_traits>
 
+// Pack symbol info for faster access during decoding
+// NOTE: This is safe for PROB_SCALE <= 2**15
+struct __align__(4) RansSymInfoPacked {
+    uint16_t freq;
+    uint16_t cdf;
+};
+
+// Wide symbol info for decoding
+// NOTE: This is safe for PROB_SCALE > 2**15
+struct __align__(8) RansSymInfoWide {
+    uint32_t freq;
+    uint32_t cdf;
+};
+
 // RANS type configuration struct
 template <typename T_symbol, typename T_state, typename T_io, int T_prob_bits>
 struct RansTraits {
@@ -25,21 +39,15 @@ struct RansTraits {
     // Lower bound for renormalization
     static constexpr int state_l_exp = (io_bits == 8) ? 16 : 24;
     static constexpr state_t rans_l = static_cast<state_t>(1) << state_l_exp;
+
+    // Use packed CDF and frequency info if possible
+    using sym_info_t =
+        typename std::conditional<(prob_bits > 16),
+                                  RansSymInfoWide,  // True: Use 64-bit struct
+                                  RansSymInfoPacked // False: Use 32-bit struct
+                                  >::type;
 };
 
-// Pack symbol info for faster access during decoding
-// NOTE: This is safe for PROB_SCALE <= 2**15
-struct __align__(4) RansSymInfoPacked {
-    uint16_t freq;
-    uint16_t cdf;
-};
-
-// Wide symbol info for decoding
-// NOTE: This is safe for PROB_SCALE > 2**15
-struct __align__(8) RansSymInfoWide {
-    uint32_t freq;
-    uint32_t cdf;
-};
 
 // CDF and Frequency tables for encoding
 template <typename RansConfig> struct RansTablesCore {
@@ -63,10 +71,11 @@ template <typename RansConfig> struct RansEncoderCtx {
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;
     using io_t = typename RansConfig::io_t;
+	using sym_info_t = typename RansConfig::sym_info_t;
 
     // Input data
     const symbol_t *__restrict__ symbols;
-    const uint32_t input_size; // This is same for each stream
+    uint32_t input_size; // This is same for each stream
 
     // Output buffer
     io_t *__restrict__ output;
@@ -79,23 +88,29 @@ template <typename RansConfig> struct RansEncoderCtx {
     // Total number of interleaved streams
     uint32_t num_streams;
 
-    // Use packed CDF and frequency info if possible
-    using sym_info_t =
-        typename std::conditional<(RansConfig::prob_bits > 16),
-                                  RansSymInfoWide,  // True: Use 64-bit struct
-                                  RansSymInfoPacked // False: Use 32-bit struct
-                                  >::type;
-
     RansTablesCore<RansConfig> tables;
 };
 
-template <typename RansConfig> struct RandDecoderCtx {
+template <typename RansConfig> struct RansDecoderCtx {
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;
     using io_t = typename RansConfig::io_t;
+	using sym_info_t = typename RansConfig::sym_info_t;
 
-    io_t *__restrict__ input;
-    state_t *initial_states;
+    io_t* __restrict__ input;
+    state_t* __restrict__ initial_states;
 
-    uint32_t *input_sizes
-}
+    uint32_t* __restrict__ input_sizes;
+
+	symbol_t* __restrict__ output;
+	uint32_t output_size; // This is same for each stream
+
+	// Capacity of each interleaved stream
+	uint32_t stream_capacity;
+
+	// Total number of interleaved streams
+	uint32_t num_streams;
+
+	RansTablesFull<RansConfig> tables;
+
+};
