@@ -138,6 +138,12 @@ __global__ void rans_decompress_kernel(RansDecoderCtx<RansConfig> ctx) {
     uint32_t out_idx = gid;
     uint32_t out_stride = ctx.num_streams;
 
+    uint32_t stride = ctx.num_streams;
+    // Points to the *current* byte to be read
+    const io_t* input_ptr = ctx.input + (stream_offset * stride) + gid;
+    // We also keep the base pointer to check for underflow (safety)
+    const io_t* input_base = ctx.input + gid;
+
     state_t state = ctx.initial_states[gid];
 
 	// Decompression loop
@@ -156,12 +162,31 @@ __global__ void rans_decompress_kernel(RansDecoderCtx<RansConfig> ctx) {
         // Update State
         state = info.freq * (state >> RansConfig::prob_bits) + (slot - info.cdf);
 
-        // Renormalize
-        while (state < RansConfig::rans_l && stream_offset >= 0) {
-            // Read from input stream (Strided Access)
-			io_t value = ctx.input[stream_offset * ctx.num_streams + gid];
-            stream_offset--;
-            state = (state << RansConfig::io_bits) | value;
-        }
+        // Original renormalization loop
+        // while (state < RansConfig::rans_l && stream_offset >= 0) {
+        //     // Read from input stream (Strided Access)
+		// 	io_t value = ctx.input[stream_offset * ctx.num_streams + gid];
+        //     stream_offset--;
+        //     state = (state << RansConfig::io_bits) | value;
+        // }
+
+		// NOTE: For int8 IO we know that unrolling twice is enough
+		// Unrolled renormalization for up to 2 reads
+		if (state < RansConfig::rans_l) {
+			// Safety check: ensure we don't read before start of stream
+			if (input_ptr >= input_base) {
+				state = (state << RansConfig::io_bits) | *input_ptr;
+				input_ptr -= stride; // Move pointer back by 1 row
+			}
+
+			// Second byte check
+			if (state < RansConfig::rans_l) {
+				if (input_ptr >= input_base) {
+					state = (state << RansConfig::io_bits) | *input_ptr;
+					input_ptr -= stride;
+				}
+			}
+		}
+
     }
 }
