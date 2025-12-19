@@ -37,7 +37,7 @@ struct RansTraits {
     static constexpr int io_mask = (1 << io_bits) - 1;
 
     // Lower bound for renormalization
-    static constexpr int state_l_exp = (io_bits == 8) ? 16 : 24;
+    static constexpr int state_l_exp = (io_bits == 8) ? 16 : 24; // 2**16 for byte, 2**24 for word
     static constexpr state_t rans_l = static_cast<state_t>(1) << state_l_exp;
 
     // Use packed CDF and frequency info if possible

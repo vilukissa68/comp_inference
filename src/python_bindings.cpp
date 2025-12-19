@@ -1,89 +1,123 @@
-
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
-#include "cpp/wrapper.hpp"  // Your CUDA helper functions
+#include <pybind11/stl.h> 
+
+// FIX: Include CUDA Runtime directly here
+#include <cuda_runtime.h> 
+
+#include "cpp/rans.hpp" 
 
 namespace py = pybind11;
+using namespace pybind11::literals;
 
-// -----------------------------
-// linear_forward
-// -----------------------------
-torch::Tensor linear_forward_cuda(
-    torch::Tensor input,
-    torch::Tensor weight,
-    torch::Tensor bias);  // CUDA implementation declared elsewhere
-
-torch::Tensor linear_forward(
-    torch::Tensor input,
-    torch::Tensor weight,
-    torch::Tensor bias) {
-
+// ... [Keep linear_forward] ...
+torch::Tensor linear_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
+torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
     TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
-    if (bias.defined())
-        TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
-
+    if (bias.defined()) TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
     return linear_forward_cuda(input, weight, bias);
 }
 
-// -----------------------------
-// _core module
-// -----------------------------
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Python bindings for CUDA accelerated operations";
 
-    // Linear forward
     m.def("linear_forward", &linear_forward, "Custom Linear forward (CUDA)");
 
-    // Vector add
-    m.def(
-        "vector_add",
-        [](py::array_t<float> a, py::array_t<float> b) {
-            py::buffer_info a_info = a.request();
-            py::buffer_info b_info = b.request();
+    m.def("allocate_pinned_memory", [](size_t size) {
+        void* ptr = nullptr;
+        // Direct call to CUDA Runtime API
+        if (cudaMallocHost(&ptr, size) != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate pinned memory");
+        }
+        
+        py::capsule free_when_done(ptr, [](void* p) {
+            cudaFreeHost(p);
+        });
 
-            if (a_info.ndim != 1 || b_info.ndim != 1)
-                throw std::runtime_error("Arrays must be 1D");
-            if (a_info.size != b_info.size)
-                throw std::runtime_error("Arrays must have same size");
+        return py::array_t<uint8_t>(
+            {size}, {sizeof(uint8_t)}, (uint8_t*)ptr, free_when_done
+        );
+    }, "Allocates a pinned numpy array");
 
-            size_t size = a_info.size;
-            py::array_t<float> result(size);
-            py::buffer_info r_info = result.request();
+    py::class_<RansManager::CompressResult>(m, "CompressResult")
+        .def_property_readonly("stream", [](const RansManager::CompressResult& r) {
+            return py::array_t<uint8_t>(r.stream.size(), r.stream.data());
+        })
+        .def_property_readonly("states", [](const RansManager::CompressResult& r) {
+            return py::array_t<uint32_t>(r.states.size(), r.states.data());
+        })
+        .def_property_readonly("output_sizes", [](const RansManager::CompressResult& r) {
+            return py::array_t<uint32_t>(r.sizes.size(), r.sizes.data());
+        })
+        .def_readonly("num_streams", &RansManager::CompressResult::num_streams)
+        .def_readonly("stream_len", &RansManager::CompressResult::stream_len);
 
-            cuda_vector_add(
-                static_cast<float *>(a_info.ptr),
-                static_cast<float *>(b_info.ptr),
-                static_cast<float *>(r_info.ptr),
-                size
+    py::class_<RansManager>(m, "RansManager")
+        .def(py::init<size_t>(), "max_data_hint"_a = 0)
+        
+        .def("compress", [](RansManager& self, 
+                            py::array_t<uint8_t> data, 
+                            py::array_t<uint16_t> freqs, 
+                            py::array_t<uint16_t> cdf) {
+            auto d = data.request();
+            auto f = freqs.request();
+            auto c = cdf.request();
+            return self.compress((uint8_t*)d.ptr, d.size, (uint16_t*)f.ptr, (uint16_t*)c.ptr);
+        })
+
+        .def("decompress_into", [](RansManager& self,
+                                   py::array_t<uint8_t> stream,
+                                   py::array_t<uint32_t> states,
+                                   py::array_t<uint32_t> sizes,
+                                   uint32_t num_streams,
+                                   py::array_t<uint16_t> freqs,
+                                   py::array_t<uint16_t> cdf,
+                                   py::array_t<uint8_t> output_buffer) {
+
+            auto s_inf = stream.request();
+            auto st_inf = states.request();
+            auto sz_inf = sizes.request();
+            auto f_inf = freqs.request();
+            auto c_inf = cdf.request();
+            auto out_inf = output_buffer.request();
+
+            float time_ms = self.decompress(
+                (uint8_t*)s_inf.ptr, s_inf.size,
+                (uint32_t*)st_inf.ptr, (uint32_t*)sz_inf.ptr,
+                num_streams, out_inf.size,
+                (uint16_t*)f_inf.ptr, (uint16_t*)c_inf.ptr,
+                (uint8_t*)out_inf.ptr 
             );
+            return time_ms;
+        })
 
-            return result;
-        },
-        "Add two vectors using CUDA"
-    );
+        .def("decompress", [](RansManager& self,
+                              py::array_t<uint8_t> stream,
+                              py::array_t<uint32_t> states,
+                              py::array_t<uint32_t> sizes,
+                              uint32_t num_streams,
+                              size_t output_len,
+                              py::array_t<uint16_t> freqs,
+                              py::array_t<uint16_t> cdf) {
+            
+            auto s_inf = stream.request();
+            auto st_inf = states.request();
+            auto sz_inf = sizes.request();
+            auto f_inf = freqs.request();
+            auto c_inf = cdf.request();
 
-    // Simulate decompression
-    m.def(
-        "simulate_decompression",
-        [](py::array_t<uint8_t> input, uint64_t output_size) {
-            py::buffer_info in_info = input.request();
-            if (in_info.ndim != 1)
-                throw std::runtime_error("Arrays must be 1D");
+            auto output = py::array_t<uint8_t>(output_len);
+            auto out_inf = output.request();
 
-            py::array_t<uint8_t> output(output_size);
-            py::buffer_info out_info = output.request();
-
-            float decomp_time_ms = simulate_decompression(
-                static_cast<uint8_t *>(in_info.ptr),
-                static_cast<uint8_t *>(out_info.ptr),
-                in_info.size,
-                output_size
+            float time_ms = self.decompress(
+                (uint8_t*)s_inf.ptr, s_inf.size,
+                (uint32_t*)st_inf.ptr, (uint32_t*)sz_inf.ptr,
+                num_streams, output_len,
+                (uint16_t*)f_inf.ptr, (uint16_t*)c_inf.ptr,
+                (uint8_t*)out_inf.ptr 
             );
-
-            return py::make_tuple(output, decomp_time_ms);
-        },
-        "Simulate decompression using CUDA"
-    );
+            return py::make_tuple(output, time_ms);
+        });
 }

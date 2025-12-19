@@ -177,7 +177,7 @@ cpp_sources = [
 cuda_sources = [
     "src/cuda/kernels.cu",
     "src/cuda/compressed_linear.cu",
-    "src/cuda/ans.cu",
+    "src/cuda/rans_ops.cu",
 ]
 
 sources = cpp_sources + (cuda_sources if use_cuda else [])

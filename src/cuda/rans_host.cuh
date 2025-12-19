@@ -1,0 +1,279 @@
+#pragma once
+#include <cuda_runtime.h>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <iomanip>
+
+#include "rans.cuh"          
+#include "rans_kernels.cuh"  
+
+#define CUDA_CHECK(call) \
+    do { \
+         cudaError_t err = call; \
+         if (err != cudaSuccess) { \
+             fprintf(stderr, "CUDA Error: %s at %s:%d\n", \
+                     cudaGetErrorString(err), __FILE__, __LINE__); \
+            throw std::runtime_error("CUDA Error"); \
+         } \
+     } while (0)
+
+struct RansConfig8 : public RansTraits<uint8_t, uint32_t, uint8_t, 12> {
+    using sym_info_t = RansSymInfoPacked;
+};
+
+template <typename Config>
+struct RansWorkspace {
+    using symbol_t = typename Config::symbol_t;
+    using io_t = typename Config::io_t;
+    using sym_info_t = typename Config::sym_info_t;
+    using state_t = typename Config::state_t;
+
+    // Pointers
+    sym_info_t* d_sym_info = nullptr;
+    symbol_t* d_symbols = nullptr;
+    io_t* d_output = nullptr;
+    state_t* d_states = nullptr;
+    uint32_t* d_sizes = nullptr;
+    
+    symbol_t* d_slot_map = nullptr;
+    io_t* d_input = nullptr;
+    state_t* d_init_states = nullptr;
+    uint32_t* d_input_sizes = nullptr;
+    symbol_t* d_decoded_output = nullptr;
+
+    // Individual Capacities (in bytes) to prevent overflow
+    size_t cap_sym_info = 0;
+    size_t cap_symbols = 0;
+    size_t cap_output = 0;
+    size_t cap_states = 0;
+    size_t cap_sizes = 0;
+    size_t cap_slot_map = 0;
+    size_t cap_input = 0;
+    size_t cap_init_states = 0;
+    size_t cap_input_sizes = 0;
+    size_t cap_decoded_output = 0;
+
+    RansWorkspace() = default;
+    
+    void realloc_if_needed(void** ptr, size_t& current_cap, size_t needed_bytes) {
+        if (needed_bytes > current_cap) {
+            // Safety margin: 1.1x growth to prevent frequent reallocs
+            size_t alloc_size = (size_t)(needed_bytes * 1.1);
+            
+            // Align to 256 bytes for performance
+            if (alloc_size % 256 != 0) alloc_size += (256 - (alloc_size % 256));
+
+            if (*ptr) {
+                cudaDeviceSynchronize(); 
+                CUDA_CHECK(cudaFree(*ptr));
+                *ptr = nullptr;
+            }
+
+            cudaError_t err = cudaMalloc(ptr, alloc_size);
+            if (err == cudaErrorMemoryAllocation) {
+                std::cerr << "!! CRITICAL OOM ERROR !!\n";
+                std::cerr << "Requested: " << (double)alloc_size / (1024*1024) << " MB\n";
+                std::cerr << "This is likely caused by PyTorch reserving all VRAM.\n";
+                std::cerr << "Try running 'torch.cuda.empty_cache()' in Python before this call.\n";
+                throw std::runtime_error("CUDA Out of Memory in RansWorkspace");
+            }
+            CUDA_CHECK(err);
+
+            current_cap = alloc_size;
+        }
+    }
+
+    ~RansWorkspace() {
+        if(d_sym_info) cudaFree(d_sym_info);
+        if(d_symbols) cudaFree(d_symbols);
+        if(d_output) cudaFree(d_output);
+        if(d_states) cudaFree(d_states);
+        if(d_sizes) cudaFree(d_sizes);
+        if(d_slot_map) cudaFree(d_slot_map);
+        if(d_input) cudaFree(d_input);
+        if(d_init_states) cudaFree(d_init_states);
+        if(d_input_sizes) cudaFree(d_input_sizes);
+        if(d_decoded_output) cudaFree(d_decoded_output);
+    }
+
+    void resize(size_t input_sz_bytes, uint32_t streams, uint32_t cap_per_stream) {
+        size_t total_out = (size_t)streams * cap_per_stream * sizeof(io_t);
+        
+        realloc_if_needed((void**)&d_sym_info, cap_sym_info, Config::vocab_size * sizeof(sym_info_t));
+        realloc_if_needed((void**)&d_symbols,  cap_symbols,  input_sz_bytes);
+        realloc_if_needed((void**)&d_output,   cap_output,   total_out);
+        realloc_if_needed((void**)&d_states,   cap_states,   streams * sizeof(state_t));
+        realloc_if_needed((void**)&d_sizes,    cap_sizes,    streams * sizeof(uint32_t));
+    }
+    
+    void resize_dec(size_t in_bytes, size_t out_bytes, uint32_t streams) {
+        realloc_if_needed((void**)&d_slot_map,      cap_slot_map,       Config::prob_scale * sizeof(symbol_t));
+        realloc_if_needed((void**)&d_input,         cap_input,          in_bytes);
+        realloc_if_needed((void**)&d_init_states,   cap_init_states,    streams * sizeof(state_t));
+        realloc_if_needed((void**)&d_input_sizes,   cap_input_sizes,    streams * sizeof(uint32_t));
+        realloc_if_needed((void**)&d_decoded_output,cap_decoded_output, out_bytes);
+    }
+};
+
+struct KernelConfig {
+    int block_size;
+    uint32_t num_streams;
+};
+
+template <typename Config>
+struct StreamConfigurator {
+    static KernelConfig suggest(size_t total_data_size) {
+        int device;
+        cudaGetDevice(&device);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, device);
+
+        int min_grid_size, best_block_size;
+        cudaOccupancyMaxPotentialBlockSize(
+            &min_grid_size, 
+            &best_block_size, 
+            rans_compress_kernel<Config>, 
+            0, 0);
+
+        uint32_t target_chunk_size = 4096; 
+        uint32_t suggested_streams = (total_data_size + target_chunk_size - 1) / target_chunk_size;
+        uint32_t min_streams_for_saturation = prop.multiProcessorCount * 4 * best_block_size;
+        
+        if (suggested_streams < min_streams_for_saturation) suggested_streams = min_streams_for_saturation;
+        suggested_streams = std::min((uint32_t)total_data_size, suggested_streams);
+        if (suggested_streams == 0) suggested_streams = 1;
+
+        return { best_block_size, suggested_streams };
+    }
+};
+
+template <typename Config>
+struct RansResultPointers {
+    const typename Config::io_t* stream;
+    const typename Config::state_t* final_states;
+    const uint32_t* output_sizes;
+    uint32_t num_streams;
+    size_t stream_len; 
+};
+
+template <typename Config>
+RansResultPointers<Config> rans_compress_cuda(
+    RansWorkspace<Config>& ws,
+    const typename Config::symbol_t* host_data, 
+    size_t input_size,
+    const uint16_t *host_freqs, const uint16_t *host_cdf, 
+    KernelConfig k_conf)
+{
+    using symbol_t = typename Config::symbol_t;
+    using io_t = typename Config::io_t;
+    using sym_info_t = typename Config::sym_info_t;
+
+    uint32_t num_streams = k_conf.num_streams;
+    size_t syms_per_stream = (input_size + num_streams - 1) / num_streams;
+    uint32_t capacity = (uint32_t)(syms_per_stream * 1.25) + 64; 
+
+    std::vector<sym_info_t> host_sym_info(Config::vocab_size);
+    for (int i = 0; i < Config::vocab_size; ++i) {
+        host_sym_info[i].freq = host_freqs[i];
+        host_sym_info[i].cdf = host_cdf[i];
+    }
+
+    ws.resize(input_size * sizeof(symbol_t), num_streams, capacity);
+
+    cudaStream_t stream = 0;
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_sym_info, host_sym_info.data(), Config::vocab_size * sizeof(sym_info_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_symbols, host_data, input_size * sizeof(symbol_t), cudaMemcpyHostToDevice, stream));
+
+    RansEncoderCtx<Config> ctx;
+    ctx.num_streams = num_streams;
+    ctx.stream_capacity = capacity;
+    ctx.symbols = ws.d_symbols;
+    const_cast<uint32_t &>(ctx.input_size) = (uint32_t)input_size;
+    ctx.output = ws.d_output;
+    ctx.final_states = ws.d_states;
+    ctx.output_sizes = ws.d_sizes;
+    ctx.tables.sym_info = ws.d_sym_info;
+
+    int block = k_conf.block_size;
+    int grid = (num_streams + block - 1) / block;
+
+    rans_compress_kernel<Config><<<grid, block, 0, stream>>>(ctx);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    return {
+        ws.d_output,
+        ws.d_states,
+        ws.d_sizes,
+        num_streams,
+        (size_t)num_streams * capacity
+    };
+}
+
+template <typename Config>
+std::pair<const typename Config::symbol_t*, float> rans_decompress_cuda(
+    RansWorkspace<Config>& ws,
+    const typename Config::io_t* stream_ptr,
+    size_t stream_size_bytes,
+    const typename Config::state_t* states_ptr, 
+    const uint32_t* sizes_ptr,
+    uint32_t num_streams,
+    uint32_t symbols_per_stream,
+    const uint16_t *host_freqs, const uint16_t *host_cdf) 
+{
+    using symbol_t = typename Config::symbol_t;
+    using sym_info_t = typename Config::sym_info_t;
+
+    uint32_t capacity_per_stream = stream_size_bytes / num_streams;
+
+    std::vector<sym_info_t> host_sym_info(Config::vocab_size);
+    std::vector<symbol_t> host_slot_map(Config::prob_scale);
+
+    for (int i = 0; i < Config::vocab_size; ++i) {
+        host_sym_info[i].freq = host_freqs[i];
+        host_sym_info[i].cdf = host_cdf[i];
+        for(int j=0; j<host_freqs[i]; ++j) host_slot_map[host_cdf[i] + j] = (symbol_t)i;
+    }
+
+    size_t input_bytes = stream_size_bytes;
+    size_t output_bytes = (size_t)symbols_per_stream * num_streams * sizeof(symbol_t);
+
+    ws.resize_dec(input_bytes, output_bytes, num_streams);
+    
+    cudaStream_t stream = 0;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_sym_info, host_sym_info.data(), Config::vocab_size * sizeof(sym_info_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_slot_map, host_slot_map.data(), Config::prob_scale * sizeof(symbol_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_input, stream_ptr, input_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_init_states, states_ptr, num_streams * sizeof(typename Config::state_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_input_sizes, sizes_ptr, num_streams * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+
+    RansDecoderCtx<Config> ctx;
+    ctx.input = ws.d_input;
+    ctx.initial_states = ws.d_init_states;
+    ctx.input_sizes = ws.d_input_sizes;
+    ctx.output = ws.d_decoded_output;
+    ctx.output_size = symbols_per_stream;
+    ctx.stream_capacity = capacity_per_stream;
+    ctx.num_streams = num_streams;
+    ctx.tables.sym_info = ws.d_sym_info;
+    ctx.tables.slot_to_sym = ws.d_slot_map;
+
+    int min_grid, best_block;
+    cudaOccupancyMaxPotentialBlockSize(&min_grid, &best_block, rans_decompress_kernel<Config>, 0, 0);
+    int grid = (num_streams + best_block - 1) / best_block;
+
+    cudaEventRecord(start, stream);
+    rans_decompress_kernel<Config><<<grid, best_block, 0, stream>>>(ctx);
+    cudaEventRecord(stop, stream);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+
+    return { ws.d_decoded_output, ms };
+}
