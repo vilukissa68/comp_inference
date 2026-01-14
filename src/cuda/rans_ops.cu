@@ -1,4 +1,4 @@
-#include "../cpp/rans.hpp" 
+#include "rans.hpp" 
 #include "rans_host.cuh"   
 #include <vector>
 

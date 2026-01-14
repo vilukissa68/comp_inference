@@ -4,12 +4,7 @@ import sys
 import os
 import torch
 
-try:
-    #import comp_inference._core as _core
-    from comp_inference import _core
-except ImportError:
-    print("Error: Could not import _core.")
-    sys.exit(1)
+import comp_inference.ccore as ccore
 
 def print_pass(msg):
     print(f"\033[92m[PASS] {msg}\033[0m")
@@ -67,9 +62,9 @@ def benchmark(size_mb=256, iterations=5):
 
     # Setup pinned memory
     print("Setting up pinned memory...")
-    pinned_input = _core.allocate_pinned_memory(size_bytes)
-    pinned_output = _core.allocate_pinned_memory(size_bytes)
-    pinned_stream_staging = _core.allocate_pinned_memory(int(len(data) * 1.5))
+    pinned_input = ccore.allocate_pinned_memory(size_bytes)
+    pinned_output = ccore.allocate_pinned_memory(size_bytes)
+    pinned_stream_staging = ccore.allocate_pinned_memory(int(len(data) * 1.5))
 
     np.copyto(pinned_input, data)
 
@@ -79,7 +74,7 @@ def benchmark(size_mb=256, iterations=5):
     print("-" * 50)
 
     try:
-        manager = _core.RansManager(size_bytes)
+        manager = ccore.RansManager(size_bytes)
         print("RansManager initialized (GPU Workspace allocated).")
     except Exception as e:
         print_fail(f"Failed to init manager: {e}")
@@ -87,7 +82,7 @@ def benchmark(size_mb=256, iterations=5):
 
     print("Warming up GPU...")
     res = manager.compress(pinned_input, freqs, cdf)
-    pinned_stream = _core.allocate_pinned_memory(res.stream.size)
+    pinned_stream = ccore.allocate_pinned_memory(res.stream.size)
 
     print("Compression warm-up done.")
     _ = manager.decompress(pinned_stream, res.states, res.output_sizes, 

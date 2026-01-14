@@ -1,124 +1,8 @@
 import torch
 import torch.nn as nn
-from comp_inference.layers.compressed_linear import CompressedLinear
-from comp_inference.layers.compressed_embedding import CompressedEmbedding
-from comp_inference.layers.compressed_layer_norm import CompressedLayerNorm
 import numpy as np
-from comp_inference import _core
-
-# TODO: Deprecate all this
-
-
-def replace_linear_with_compressed(module: nn.Module) -> nn.Module:
-    """
-    Recursively replace all nn.Linear layers with CompressedLinear.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            new_layer = CompressedLinear(
-                child.in_features, child.out_features, bias=(child.bias is not None)
-            )
-            # Copy weights and bias
-            new_layer.weight.data.copy_(child.weight.data)
-            if child.bias is not None:
-                new_layer.bias.data.copy_(child.bias.data)
-            setattr(module, name, new_layer)
-        else:
-            replace_linear_with_compressed(child)
-    return module
-
-
-def replace_embedding_with_compressed(module: nn.Module) -> nn.Module:
-    """
-    Recursively replace all nn.Embedding layers with CompressedEmbedding.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Embedding):
-            new_layer = CompressedEmbedding(
-                num_embeddings=child.num_embeddings,
-                embedding_dim=child.embedding_dim,
-                padding_idx=child.padding_idx,
-                max_norm=child.max_norm,
-                norm_type=child.norm_type,
-                scale_grad_by_freq=child.scale_grad_by_freq,
-                sparse=child.sparse,
-            )
-
-            # Copy weights
-            new_layer.weight.data.copy_(child.weight.data)
-            setattr(module, name, new_layer)
-        else:
-            replace_embedding_with_compressed(child)
-    return module
-
-
-def replace_layer_norm_with_compressed(module: nn.Module) -> nn.Module:
-    """
-    Recursively replace all nn.LayerNorm layers with CompressedLayerNorm.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.LayerNorm):
-            new_layer = CompressedLayerNorm(
-                normalized_shape=child.normalized_shape,
-                eps=child.eps,
-                elementwise_affine=child.elementwise_affine,
-            )
-            # Copy weights and bias if they exist
-            if child.elementwise_affine:
-                new_layer.weight.data.copy_(child.weight.data)
-                new_layer.bias.data.copy_(child.bias.data)
-            setattr(module, name, new_layer)
-        else:
-            replace_layer_norm_with_compressed(child)
-    return module
-
-
-def replace_all_with_compressed(module: nn.Module) -> nn.Module:
-    """
-    Recursively replace all supported layers in a model with their compressed equivalents.
-    Supported layers: Linear, Embedding, LayerNorm
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            new_layer = CompressedLinear(
-                child.in_features, child.out_features, bias=(child.bias is not None)
-            )
-            new_layer.weight.data.copy_(child.weight.data)
-            if child.bias is not None:
-                new_layer.bias.data.copy_(child.bias.data)
-            setattr(module, name, new_layer)
-
-        elif isinstance(child, nn.Embedding):
-            new_layer = CompressedEmbedding(
-                num_embeddings=child.num_embeddings,
-                embedding_dim=child.embedding_dim,
-                padding_idx=child.padding_idx,
-                # max_norm=child.max_norm,
-                # norm_type=child.norm_type,
-                # scale_grad_by_freq=child.scale_grad_by_freq,
-                # sparse=child.sparse,
-            )
-            new_layer.weight.data.copy_(child.weight.data)
-            setattr(module, name, new_layer)
-
-        elif isinstance(child, nn.LayerNorm):
-            new_layer = CompressedLayerNorm(
-                normalized_shape=child.normalized_shape,
-                eps=child.eps,
-                elementwise_affine=child.elementwise_affine,
-            )
-            if child.elementwise_affine:
-                new_layer.weight.data.copy_(child.weight.data)
-                new_layer.bias.data.copy_(child.bias.data)
-            setattr(module, name, new_layer)
-
-        else:
-            replace_all_with_compressed(child)
-
-    return module
-
-
-##### New API
+#from . import _ccore
+from typing import Tuple
 
 
 def extract_exp_and_mantissa(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -237,7 +121,7 @@ def rans_compress_module_weight_bf16(module: nn.Module) -> None:
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
     module.mantissa_freqs, module.mantissa_cdf = get_rans_lut(mantissa.to(torch.uint8))
 
-    memory_manager = _core.RansManager(module.weight.numel)
+    memory_manager = _ccore.RansManager(module.weight.numel)
     exponent_compression = memory_manager.compress(
         exponent.cpu().numpy().astype(np.uint8),
         module.exponent_cdf.numpy(),
@@ -286,7 +170,7 @@ def rans_compress_module_weight_int8(module: nn.Module) -> None:
             module.freqs = freqs
 
     size_in_bytes = module.weight.numel
-    memory_manager = _core.RansManager(module.weight.numel)
+    memory_manager = _ccore.RansManager(module.weight.numel)
 
     weight_np = module.weight.cpu().numpy()
     compression_result = memory_manager.compress(
@@ -313,31 +197,17 @@ def rans_compress_module_weight_int8(module: nn.Module) -> None:
     print("Module weight compressed using RANS.")
 
 
-def rans_decompress_module_weight(module: nn.Module) -> None:
-    """
-    Dispatcher: Checks the compression type and calls the correct decompressor.
-    """
-    if not hasattr(module, "compressed"):
-        # This is normal for layers like LayerNorm or activation functions
-        # that don't have weights or weren't compressed.
+def rans_compress_module_weight(module: nn.Module) -> None:
+    if not hasattr(module, "weight"):
         return
-
-    # Dispatch based on the flag set during compression
-    if module.compressed == "rans_bfloat16":
-        rans_decompress_module_weight_bf16(module)
-    elif module.compressed == "rans_int8":
-        rans_decompress_module_weight_int8(module)
+    if module.weight.dtype == torch.bfloat16:
+        rans_compress_module_weight_bf16(module)
+    elif module.weight.dtype in [torch.uint8, torch.int8]:
+        rans_compress_module_weight_int8(module)
     else:
-        print(f"Unknown compression type: {module.compressed}")
-        return
-
-    # CRITICAL STEP FOR HUGGING FACE INFERENCE:
-    # The decompression puts a raw Tensor into module.weight.
-    # We must wrap it in nn.Parameter so the model treats it as a trainable/model weight
-    # and not just a buffer.
-    if not isinstance(module.weight, nn.Parameter):
-        module.weight = nn.Parameter(module.weight, requires_grad=False)
-
+        print(
+        f"Module weight dtype is {module.weight.dtype}, not supported for RANS compression. Skipping."
+        )
 
 def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if not hasattr(module, "compressed"):
@@ -350,9 +220,9 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         return
 
     # Manager handles the decoding logic
-    manager_exp = _core.RansManager(module.exponent_stream_size)
+    manager_exp = _ccore.RansManager(module.exponent_stream_size)
 
-    raw_exponent = _core.allocate_pinned_memory(module.expanded_size)
+    raw_exponent = _ccore.allocate_pinned_memory(module.expanded_size)
 
     _ = manager_exp.decompress(
         raw_exponent,  # Output buffer (Destination)
@@ -364,10 +234,10 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         module.exponent_cdf,
     )
 
-    manager_man = _core.RansManager(module.mantissa_stream_size)
+    manager_man = _ccore.RansManager(module.mantissa_stream_size)
 
     # Output buffer for mantissas
-    raw_mantissa = _core.allocate_pinned_memory(module.expanded_size)
+    raw_mantissa = _ccore.allocate_pinned_memory(module.expanded_size)
 
     _ = manager_man.decompress(
         raw_mantissa,
@@ -408,9 +278,9 @@ def rans_decompress_module_weight_int8(module: nn.Module) -> None:
         return
 
     # Reserve space for decompressed weight
-    manager = _core.RansManager(module.stream_size)
+    manager = _ccore.RansManager(module.stream_size)
     # Allocate pinned memory for decompressed weight
-    pinned_stream = _core.allocate_pinned_memory(module.stream_size)
+    pinned_stream = _ccore.allocate_pinned_memory(module.stream_size)
 
     _ = manager.decompress(
         pinned_stream,
@@ -429,3 +299,30 @@ def rans_decompress_module_weight_int8(module: nn.Module) -> None:
     module.weight = decompressed_weight
 
     print("Module weight decompressed using RANS.")
+
+def rans_decompress_module_weight(module: nn.Module) -> None:
+    """
+    Dispatcher: Checks the compression type and calls the correct decompressor.
+    """
+    if not hasattr(module, "compressed"):
+        # This is normal for layers like LayerNorm or activation functions
+        # that don't have weights or weren't compressed.
+        return
+
+    # Dispatch based on the flag set during compression
+    if module.compressed == "rans_bfloat16":
+        rans_decompress_module_weight_bf16(module)
+    elif module.compressed == "rans_int8":
+        rans_decompress_module_weight_int8(module)
+    else:
+        print(f"Unknown compression type: {module.compressed}")
+        return
+
+    # CRITICAL STEP FOR HUGGING FACE INFERENCE:
+    # The decompression puts a raw Tensor into module.weight.
+    # We must wrap it in nn.Parameter so the model treats it as a trainable/model weight
+    # and not just a buffer.
+    if not isinstance(module.weight, nn.Parameter):
+        module.weight = nn.Parameter(module.weight, requires_grad=False)
+
+

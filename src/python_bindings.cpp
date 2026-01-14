@@ -11,19 +11,8 @@
 namespace py = pybind11;
 using namespace pybind11::literals;
 
-// ... [Keep linear_forward] ...
-torch::Tensor linear_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
-torch::Tensor linear_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
-    if (bias.defined()) TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
-    return linear_forward_cuda(input, weight, bias);
-}
-
-PYBIND11_MODULE(_core, m) {
+PYBIND11_MODULE(ccore, m) {
     m.doc() = "Python bindings for CUDA accelerated operations";
-
-    m.def("linear_forward", &linear_forward, "Custom Linear forward (CUDA)");
 
     m.def("allocate_pinned_memory", [](size_t size) {
         void* ptr = nullptr;

@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <cstdint>
+#include <cuda_runtime_api.h>
 
 struct RansWorkspaceWrapper; 
 
@@ -35,7 +36,7 @@ public:
         uint32_t num_streams,
         size_t output_size,
         const uint16_t* freqs, const uint16_t* cdf,
-        uint8_t* output_buffer,
+        uint8_t* output_buffer
     );
 
 private:
