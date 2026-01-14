@@ -5,6 +5,10 @@ from .comp_infernece import (
     replace_embedding_with_compressed,
     replace_layer_norm_with_compressed,
     replace_all_with_compressed,
+    fill_ans_table,
+    rans_compress_module_weight
+    rans_decompress_module_weight,
+
 )
 from .layers.compressed_linear import CompressedLinear
 from .layers.compressed_embedding import CompressedEmbedding
