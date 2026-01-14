@@ -120,49 +120,36 @@ struct StreamConfigurator {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, device);
 
-        // Determine optimal Block Size for this GPU
         int min_grid_size, best_block_size;
-        // This calculates best block size based on registers/shared mem of the kernel
         cudaOccupancyMaxPotentialBlockSize(
             &min_grid_size, 
             &best_block_size, 
             rans_compress_kernel<Config>, 
             0, 0);
 
-        // Determine Optimal Number of Streams
-        // Heuristic: We want a chunk size around 4KB - 16KB for rANS.
-        // Too small (<512B) = Thread overhead dominates.
-        // Too large (>64KB) = Divergence issues & tail effects.
-        
-        // Target 4KB per stream as a baseline sweet spot
         uint32_t target_chunk_size = 4096; 
-        
-        // Calculate streams based on target chunk
         uint32_t suggested_streams = (total_data_size + target_chunk_size - 1) / target_chunk_size;
-
-        // Constraint A: Saturation
-        // We need enough blocks to hide latency. 
-        // 1080 Ti (28 SMs) vs 4090 (128 SMs).
-        // Aim for at least 4 blocks per SM (latency hiding).
         uint32_t min_streams_for_saturation = prop.multiProcessorCount * 4 * best_block_size;
         
-        // If 4KB chunks aren't enough to fill the GPU, chop them smaller (down to 512B)
         if (suggested_streams < min_streams_for_saturation) {
             suggested_streams = min_streams_for_saturation;
         }
-
-        // Constraint B: Hardware Limits
-        // Don't exceed maximum grid dimensions (usually 2^31-1, unlikely to hit)
-        // Ensure streams isn't larger than total bytes (1 byte per stream minimum)
         suggested_streams = std::min((uint32_t)total_data_size, suggested_streams);
-
-        // Ensure at least 1 stream
         if (suggested_streams == 0) suggested_streams = 1;
 
         return { best_block_size, suggested_streams };
     }
 };
 
+// --- HELPER: RAII CUDA Event wrapper ---
+struct CudaTimer {
+    cudaEvent_t start, stop;
+    CudaTimer() { cudaEventCreate(&start); cudaEventCreate(&stop); }
+    ~CudaTimer() { cudaEventDestroy(start); cudaEventDestroy(stop); }
+    void record_start(cudaStream_t s) { cudaEventRecord(start, s); }
+    void record_stop(cudaStream_t s) { cudaEventRecord(stop, s); }
+    float elapsed() { float ms; cudaEventElapsedTime(&ms, start, stop); return ms; }
+};
 
 template <typename Config>
 RansResult<Config> rans_compress_cuda(
@@ -175,10 +162,16 @@ RansResult<Config> rans_compress_cuda(
     using io_t = typename Config::io_t;
     using sym_info_t = typename Config::sym_info_t;
 
+    // Setup events
+    CudaTimer t_total, t_h2d, t_kernel, t_d2h;
+    cudaStream_t stream = 0;
+
+    // Start Total Timer
+    t_total.record_start(stream);
+
     uint32_t num_streams = k_conf.num_streams;
     size_t input_size = host_data.size();
     size_t syms_per_stream = (input_size + num_streams - 1) / num_streams;
-    // Padding + Safety for compression expansion
     uint32_t capacity = (uint32_t)(syms_per_stream * 1.25) + 64; 
 
     std::vector<sym_info_t> host_sym_info(Config::vocab_size);
@@ -189,9 +182,11 @@ RansResult<Config> rans_compress_cuda(
 
     ws.resize(input_size, num_streams, capacity);
 
-    cudaStream_t stream = 0;
+    // --- MEASURE H2D ---
+    t_h2d.record_start(stream);
     CUDA_CHECK(cudaMemcpyAsync(ws.d_sym_info, host_sym_info.data(), Config::vocab_size * sizeof(sym_info_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(ws.d_symbols, host_data.data(), input_size * sizeof(symbol_t), cudaMemcpyHostToDevice, stream));
+    t_h2d.record_stop(stream);
 
     RansEncoderCtx<Config> ctx;
     ctx.num_streams = num_streams;
@@ -203,36 +198,44 @@ RansResult<Config> rans_compress_cuda(
     ctx.output_sizes = ws.d_sizes;
     ctx.tables.sym_info = ws.d_sym_info;
 
-    // Use the auto-tuned block size
     int block = k_conf.block_size;
     int grid = (num_streams + block - 1) / block;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
-
-    cudaEventRecord(start, stream);
+    // --- MEASURE KERNEL ---
+    t_kernel.record_start(stream);
     rans_compress_kernel<Config><<<grid, block, 0, stream>>>(ctx);
-    cudaEventRecord(stop, stream);
+    t_kernel.record_stop(stream);
 
     RansResult<Config> result;
-    result.num_streams = num_streams; // Save for decoder
+    result.num_streams = num_streams;
     result.stream.resize(num_streams * capacity);
     result.final_states.resize(num_streams);
     result.output_sizes.resize(num_streams);
 
+    // --- MEASURE D2H ---
+    t_d2h.record_start(stream);
     CUDA_CHECK(cudaMemcpyAsync(result.stream.data(), ws.d_output, num_streams * capacity * sizeof(io_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(result.final_states.data(), ws.d_states, num_streams * sizeof(typename Config::state_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(result.output_sizes.data(), ws.d_sizes, num_streams * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    t_d2h.record_stop(stream);
+
+    // Stop Total Timer
+    t_total.record_stop(stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
-    double gib_per_sec = (double)input_size / (ms * 1e-3) / (1024.0 * 1024.0 * 1024.0);
-    std::cout << "[Encoder] Time: " << std::fixed << std::setprecision(3) << ms << " ms | Throughput: " << gib_per_sec << " GiB/s"
-              << " | Grid: " << grid << " Block: " << block << " Streams: " << num_streams << "\n";
+    // Calculate metrics
+    double gb_in = (double)input_size / (1024.0 * 1024.0 * 1024.0);
+    // Approximate output bytes for D2H bandwidth (we don't know exact size until we check output_sizes, using capacity is close enough for BW estimate)
+    double gb_out = (double)(num_streams * capacity) / (1024.0 * 1024.0 * 1024.0); 
 
-    cudaEventDestroy(start); cudaEventDestroy(stop);
+    std::cout << "[Encoder Stats]\n"
+              << "  H2D Copy : " << std::fixed << std::setprecision(2) << t_h2d.elapsed() << " ms (" << gb_in / (t_h2d.elapsed()*1e-3) << " GiB/s)\n"
+              << "  Kernel   : " << t_kernel.elapsed() << " ms (" << gb_in / (t_kernel.elapsed()*1e-3) << " GiB/s)\n"
+              << "  D2H Copy : " << t_d2h.elapsed() << " ms (" << gb_out / (t_d2h.elapsed()*1e-3) << " GiB/s)\n"
+              << "  TOTAL    : " << t_total.elapsed() << " ms (" << gb_in / (t_total.elapsed()*1e-3) << " GiB/s)\n"
+              << "  Params   : Grid=" << grid << " Block=" << block << " Streams=" << num_streams << "\n";
+
     return result;
 }
 
@@ -242,15 +245,19 @@ PinnedVector<typename Config::symbol_t> rans_decompress_cuda(
     PinnedVector<typename Config::io_t> &host_stream_data,
     const PinnedVector<typename Config::state_t> &host_states, 
     const PinnedVector<uint32_t> &host_sizes,
-    uint32_t num_streams, // Must match what was used in compression
+    uint32_t num_streams,
     uint32_t symbols_per_stream,
     const uint16_t *host_freqs, const uint16_t *host_cdf) 
 {
     using symbol_t = typename Config::symbol_t;
     using sym_info_t = typename Config::sym_info_t;
 
-    // Recalculate capacity based on actual data provided
-    // NOTE: In a real application, you might store this in a header, but here we derive it
+    // Setup events
+    CudaTimer t_total, t_h2d, t_kernel, t_d2h;
+    cudaStream_t stream = 0;
+    
+    t_total.record_start(stream);
+
     uint32_t capacity_per_stream = host_stream_data.size() / num_streams;
 
     std::vector<sym_info_t> host_sym_info(Config::vocab_size);
@@ -266,13 +273,15 @@ PinnedVector<typename Config::symbol_t> rans_decompress_cuda(
     size_t output_bytes = (size_t)symbols_per_stream * num_streams * sizeof(symbol_t);
 
     ws.resize_dec(input_bytes, output_bytes, num_streams);
-    cudaStream_t stream = 0;
 
+    // --- MEASURE H2D ---
+    t_h2d.record_start(stream);
     CUDA_CHECK(cudaMemcpyAsync(ws.d_sym_info, host_sym_info.data(), Config::vocab_size * sizeof(sym_info_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(ws.d_slot_map, host_slot_map.data(), Config::prob_scale * sizeof(symbol_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(ws.d_input, host_stream_data.data(), input_bytes, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(ws.d_init_states, host_states.data(), num_streams * sizeof(typename Config::state_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(ws.d_input_sizes, host_sizes.data(), num_streams * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+    t_h2d.record_stop(stream);
 
     RansDecoderCtx<Config> ctx;
     ctx.input = ws.d_input;
@@ -285,32 +294,37 @@ PinnedVector<typename Config::symbol_t> rans_decompress_cuda(
     ctx.tables.sym_info = ws.d_sym_info;
     ctx.tables.slot_to_sym = ws.d_slot_map;
 
-    // Use Occupancy API for Decompression Block Size too
     int min_grid, best_block;
     cudaOccupancyMaxPotentialBlockSize(&min_grid, &best_block, rans_decompress_kernel<Config>, 0, 0);
-    
     int grid = (num_streams + best_block - 1) / best_block;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
-
-    cudaEventRecord(start, stream);
+    // --- MEASURE KERNEL ---
+    t_kernel.record_start(stream);
     rans_decompress_kernel<Config><<<grid, best_block, 0, stream>>>(ctx);
-    cudaEventRecord(stop, stream);
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
-    double gib_per_sec = (double)output_bytes / (ms * 1e-3) / (1024.0 * 1024.0 * 1024.0);
-    std::cout << "[Decoder] Time: " << std::fixed << std::setprecision(3) << ms << " ms | Throughput: " << gib_per_sec << " GiB/s"
-              << " | Block: " << best_block << "\n";
-
-    cudaEventDestroy(start); cudaEventDestroy(stop);
+    t_kernel.record_stop(stream);
 
     PinnedVector<symbol_t> result(num_streams * symbols_per_stream);
+    
+    // --- MEASURE D2H ---
+    t_d2h.record_start(stream);
     CUDA_CHECK(cudaMemcpyAsync(result.data(), ws.d_decoded_output, output_bytes, cudaMemcpyDeviceToHost, stream));
+    t_d2h.record_stop(stream);
+
+    t_total.record_stop(stream);
+    
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    double gb_in = (double)input_bytes / (1024.0 * 1024.0 * 1024.0);
+    double gb_out = (double)output_bytes / (1024.0 * 1024.0 * 1024.0);
+
+    // Throughput usually defined as "Output bytes produced per second" for decoders
+    std::cout << "[Decoder Stats]\n"
+              << "  H2D Copy : " << std::fixed << std::setprecision(2) << t_h2d.elapsed() << " ms (" << gb_in / (t_h2d.elapsed()*1e-3) << " GiB/s)\n"
+              << "  Kernel   : " << t_kernel.elapsed() << " ms (" << gb_out / (t_kernel.elapsed()*1e-3) << " GiB/s)\n"
+              << "  D2H Copy : " << t_d2h.elapsed() << " ms (" << gb_out / (t_d2h.elapsed()*1e-3) << " GiB/s)\n"
+              << "  TOTAL    : " << t_total.elapsed() << " ms (" << gb_out / (t_total.elapsed()*1e-3) << " GiB/s)\n"
+              << "  Params   : Grid=" << grid << " Block=" << best_block << "\n";
+
     return result;
 }
 
@@ -344,19 +358,16 @@ int main() {
                   << "  Streams:    " << config.num_streams << "\n"
                   << "  Chunk Size: " << original_data.size() / config.num_streams << " bytes\n";
 
-        std::cout << "Starting Compression...\n";
+        std::cout << "\n--- Starting Compression ---\n";
         auto encoded = rans_compress_cuda<RansConfig8>(
             workspace, original_data, freqs.data(), cdf.data(), config);
         
         size_t stream_payload_bytes = 0;
-        // Note: d_sizes is on GPU, result.output_sizes is on CPU (Pinned). We use the CPU vector.
-        for (uint32_t size : encoded.output_sizes) {
-            stream_payload_bytes += size;
-        }
+        for (uint32_t size : encoded.output_sizes) stream_payload_bytes += size;
 
         size_t state_overhead = encoded.final_states.size() * sizeof(uint32_t);
         size_t size_header_overhead = encoded.output_sizes.size() * sizeof(uint32_t);
-        size_t table_overhead = 256 * sizeof(uint16_t) * 2; // Freq + CDF
+        size_t table_overhead = 256 * sizeof(uint16_t) * 2; 
 
         size_t total_compressed_size = stream_payload_bytes + state_overhead + size_header_overhead + table_overhead;
 
@@ -365,7 +376,7 @@ int main() {
         double bits_per_symbol = ((double)total_compressed_size * 8.0) / TOTAL_SIZE;
         double ratio = (double)TOTAL_SIZE / total_compressed_size;
 
-        std::cout << "\n--- Statistics ---\n";
+        std::cout << "\n--- Data Statistics ---\n";
         std::cout << "Original Size     : " << std::fixed << std::setprecision(2) << orig_mb << " MiB\n";
         std::cout << "Compressed Payload: " << (double)stream_payload_bytes / (1024*1024) << " MiB\n";
         std::cout << "Total Size (w/ Ovh):" << total_mb << " MiB\n";
@@ -377,7 +388,7 @@ int main() {
         
         uint32_t syms_per_stream = (TOTAL_SIZE + encoded.num_streams - 1) / encoded.num_streams;
         
-        std::cout << "\nStarting Decompression...\n";
+        std::cout << "\n--- Starting Decompression ---\n";
         auto decoded = rans_decompress_cuda<RansConfig8>(
             workspace, encoded.stream,
             encoded.final_states, encoded.output_sizes,
@@ -391,7 +402,7 @@ int main() {
                 if(errors++ < 5) std::cout << "Mismatch " << i << "\n";
             }
         }
-        if(errors == 0) std::cout << "SUCCESS: Verification Passed.\n";
+        if(errors == 0) std::cout << "\nSUCCESS: Verification Passed.\n";
 
     } catch (const std::exception &e) {
         std::cerr << "Ex: " << e.what() << "\n";
