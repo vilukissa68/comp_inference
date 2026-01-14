@@ -1,0 +1,11 @@
+[build-system]
+requires = [
+    "setuptools", 
+    "wheel", 
+    "ninja",
+    "packaging",
+    "cmake>=3.18",
+	"torch",
+    "numpy",
+]
+build-backend = "setuptools.build_meta"
