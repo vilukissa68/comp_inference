@@ -127,8 +127,6 @@ def rans_compress_module_weight_bf16(module: nn.Module) -> None:
     print(module.exponent_cdf)
     print(module.mantissa_cdf)
 
-
-
     bytes_to_allocate = module.weight.numel() * 10
     print(f"Allocating RANS memory manager with {bytes_to_allocate} bytes.")
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
@@ -152,38 +150,45 @@ def rans_compress_module_weight_bf16(module: nn.Module) -> None:
     print("Exponent compression completed.")
 
     if exponent_compression.success:
+        module.exponent_compressed_weight = torch.from_numpy(
+            exponent_compression.stream
+        )
+        module.exponent_states = exponent_compression.states
+        module.exponent_num_streams = exponent_compression.num_streams
+        module.exponent_stream_size = len(exponent_compression.stream)
+        module.exponent_output_size = exponent_compression.output_size
+
         print(
             f"Exponent compression successful: Compressed {module.weight.numel()*1} bytes to {len(exponent_compression.stream)} bytes."
         )
     else:
+        module.exponent = exponent  # Keep uncompressed
         print("Exponent compression failed.")
 
     if mantissa_compression.success:
+        # Compression was beneficial, save results
+        module.mantissa_compressed_weight = torch.from_numpy(
+            mantissa_compression.stream
+        )
+        module.mantissa_states = mantissa_compression.states
+        module.mantissa_num_streams = mantissa_compression.num_streams
+        module.mantissa_stream_size = len(mantissa_compression.stream)
+        module.mantissa_output_size = mantissa_compression.output_size
+
         print(
             f"Mantissa compression successful: Compressed {module.weight.numel()*1} bytes to {len(mantissa_compression.stream)} bytes."
         )
     else:
+        module.mantissa = mantissa  # Keep uncompressed
         print("Mantissa compression failed.")
 
-    module.compressed = "rans_bfloat16"
+    if exponent_compression.success or mantissa_compression.success:
+        # Some benefit to compression, mark module as compressed
+        module.compressed = "rans_bfloat16"
+        module.expanded_size = module.weight.numel()
 
-    module.exponent_compressed_weight = torch.from_numpy(exponent_compression.stream)
-    module.exponent_states = exponent_compression.states
-    module.exponent_num_streams = exponent_compression.num_streams
-    module.exponent_stream_size = len(exponent_compression.stream)
-    module.exponent_output_size = exponent_compression.output_size
-
-    module.mantissa_compressed_weight = torch.from_numpy(mantissa_compression.stream)
-    module.mantissa_states = mantissa_compression.states
-    module.mantissa_num_streams = mantissa_compression.num_streams
-    module.mantissa_stream_size = len(mantissa_compression.stream)
-    module.mantissa_output_size = mantissa_compression.output_size
-
-    module.expanded_size = module.weight.numel()
-
-    # Delete original weight to save memory
-    del module.weight
-    return
+        # Delete original weight to save memory
+        del module.weight
 
 
 def rans_compress_module_weight_int8(module: nn.Module) -> None:
@@ -238,8 +243,9 @@ def rans_compress_module_weight(module: nn.Module) -> None:
         rans_compress_module_weight_int8(module)
     else:
         print(
-        f"Module weight dtype is {module.weight.dtype}, not supported for RANS compression. Skipping."
+            f"Module weight dtype is {module.weight.dtype}, not supported for RANS compression. Skipping."
         )
+
 
 def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if not hasattr(module, "compressed"):
@@ -251,36 +257,44 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         )
         return
 
-    # Manager handles the decoding logic
-    manager_exp = ccore.RansManager(module.exponent_stream_size)
+    # Check if exponents where compressed
 
-    raw_exponent = ccore.allocate_pinned_memory(module.expanded_size)
+    if hasattr(module, "exponent_compressed_weight"):
+        manager_exp = ccore.RansManager(module.exponent_stream_size)
 
-    _ = manager_exp.decompress(
-        raw_exponent,  # Output buffer (Destination)
-        module.exponent_states,  # Initial states for parallel streams
-        module.exponent_output_size,
-        module.exponent_num_streams,
-        module.expanded_size,
-        module.exponent_freqs,
-        module.exponent_cdf,
-    )
+        raw_exponent = ccore.allocate_pinned_memory(module.expanded_size)
 
-    manager_man = ccore.RansManager(module.mantissa_stream_size)
+        _ = manager_exp.decompress(
+            raw_exponent,  # Output buffer (Destination)
+            module.exponent_states,  # Initial states for parallel streams
+            module.exponent_output_size,
+            module.exponent_num_streams,
+            module.expanded_size,
+            module.exponent_freqs,
+            module.exponent_cdf,
+        )
+    else:
+        raw_exponent = module.exponent
 
-    # Output buffer for mantissas
-    raw_mantissa = ccore.allocate_pinned_memory(module.expanded_size)
+    if not hasattr(module, "mantissa_compressed_weight"):
+        manager_man = ccore.RansManager(module.mantissa_stream_size)
 
-    _ = manager_man.decompress(
-        raw_mantissa,
-        module.mantissa_states,
-        module.mantissa_output_size,
-        module.mantissa_num_streams,
-        module.expanded_size,
-        module.mantissa_freqs,
-        module.mantissa_cdf,
-    )
+        # Output buffer for mantissas
+        raw_mantissa = ccore.allocate_pinned_memory(module.expanded_size)
 
+        _ = manager_man.decompress(
+            raw_mantissa,
+            module.mantissa_states,
+            module.mantissa_output_size,
+            module.mantissa_num_streams,
+            module.expanded_size,
+            module.mantissa_freqs,
+            module.mantissa_cdf,
+        )
+    else:
+        raw_mantissa = module.mantissa
+
+    # Reconstruct bf16 weights
     decompressed_flat = reconstruct_from_exp_and_mantissa(
         raw_exponent, raw_mantissa, dtype=torch.bfloat16
     )
@@ -332,6 +346,7 @@ def rans_decompress_module_weight_int8(module: nn.Module) -> None:
 
     print("Module weight decompressed using RANS.")
 
+
 def rans_decompress_module_weight(module: nn.Module) -> None:
     """
     Dispatcher: Checks the compression type and calls the correct decompressor.
@@ -356,5 +371,3 @@ def rans_decompress_module_weight(module: nn.Module) -> None:
     # and not just a buffer.
     if not isinstance(module.weight, nn.Parameter):
         module.weight = nn.Parameter(module.weight, requires_grad=False)
-
-
