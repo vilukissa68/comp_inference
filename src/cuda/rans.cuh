@@ -73,6 +73,9 @@ template <typename RansConfig> struct RansEncoderCtx {
     using io_t = typename RansConfig::io_t;
 	using sym_info_t = typename RansConfig::sym_info_t;
 
+	// Was compression successful
+	bool success;
+
     // Input data
     const symbol_t *__restrict__ symbols;
     uint32_t input_size; // This is same for each stream

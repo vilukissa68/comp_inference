@@ -6,14 +6,15 @@ import numpy as np
 from comp_inference import rans_compress_module_weight, rans_decompress_module_weight
 
 if __name__ == "__main__":
+    print("=== Full Model Round-Trip rANS Compression Test ===")
     model_name = "Qwen/Qwen3-0.6B"
 
     print(f"Loading {model_name} in Bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",  # Keep on CPU for the compression simulation
+        dtype=torch.bfloat16,
     )
+    model.to("cpu")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     input_text = "What is the capital of France?"
@@ -32,6 +33,10 @@ if __name__ == "__main__":
 
     # We use list(model.modules()) to avoid issues if the graph changes during iteration
     for name, module in model.named_modules():
+        print(f"Processing module: {name} ({type(module)})")
+        if name == "model.embed_tokens":
+            print("Skipping embedding layer.")
+            continue
         # Only target modules with weights
         if hasattr(module, "weight") and module.weight is not None:
             # Optional: Skip 1D tensors (LayerNorm) if you only want to test Linear layers

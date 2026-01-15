@@ -16,6 +16,7 @@ public:
     RansManager& operator=(const RansManager&) = delete;
 
     struct CompressResult {
+	    bool success;
         std::vector<uint8_t> stream;
         std::vector<uint32_t> states;
         std::vector<uint32_t> sizes;

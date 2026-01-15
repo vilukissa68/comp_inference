@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-#from . import _ccore
+from . import ccore
 from typing import Tuple
 
 
@@ -18,11 +18,7 @@ def extract_exp_and_mantissa(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.
 
     exp_bits, mantissa_bits, bias, storage_bits = (8, 7, 127, 16)
 
-    # reinterpret as int of correct storage width
-    if storage_bits == 16:
-        raw = tensor.view(torch.uint16).to(torch.int32)
-    else:  # float32
-        raw = tensor.view(torch.uint32).to(torch.int32)
+    raw = tensor.view(torch.uint16).to(torch.int32)
 
     # Extract fields
     sign = (raw >> (exp_bits + mantissa_bits)) & 0x1
@@ -31,7 +27,7 @@ def extract_exp_and_mantissa(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.
 
     exponent = exponent - bias
     mantissa = (sign << mantissa_bits) | mantissa
-    return exponent.to(torch.int8), (mantissa).to(torch.int8)
+    return exponent.to(torch.uint8), (mantissa).to(torch.uint8)
 
 
 @torch.compile(dynamic=True)  # Use torch.compile to fuse this into one kernel!
@@ -117,21 +113,57 @@ def rans_compress_module_weight_bf16(module: nn.Module) -> None:
         return
 
     exponent, mantissa = extract_exp_and_mantissa(module.weight)
+    print("Extracted exponent and mantissa from bf16 weights.")
 
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
+    print("Computed rANS LUTs for exponent.")
     module.mantissa_freqs, module.mantissa_cdf = get_rans_lut(mantissa.to(torch.uint8))
+    print("Computed rANS LUTs for mantissa.")
 
-    memory_manager = _ccore.RansManager(module.weight.numel)
-    exponent_compression = memory_manager.compress(
-        exponent.cpu().numpy().astype(np.uint8),
-        module.exponent_cdf.numpy(),
-        module.exponent_freqs.numpy(),
-    )
-    mantissa_compression = memory_manager.compress(
+    print(f"== Freqs ==")
+    print(module.exponent_freqs)
+    print(module.mantissa_freqs)
+    print(f"== CDFs ==")
+    print(module.exponent_cdf)
+    print(module.mantissa_cdf)
+
+
+
+    bytes_to_allocate = module.weight.numel() * 10
+    print(f"Allocating RANS memory manager with {bytes_to_allocate} bytes.")
+    exp_memory_manager = ccore.RansManager(bytes_to_allocate)
+    mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
+    print("RANS memory manager allocated.")
+
+    print("Starting mantissa compression...")
+    mantissa_compression = mantissa_memory_manager.compress(
         mantissa.cpu().numpy().astype(np.uint8),
         module.mantissa_cdf.numpy(),
         module.mantissa_freqs.numpy(),
     )
+    print("Mantissa compression completed.")
+
+    print("Starting exponent compression...")
+    exponent_compression = exp_memory_manager.compress(
+        exponent.cpu().numpy().astype(np.uint8),
+        module.exponent_cdf.numpy(),
+        module.exponent_freqs.numpy(),
+    )
+    print("Exponent compression completed.")
+
+    if exponent_compression.success:
+        print(
+            f"Exponent compression successful: Compressed {module.weight.numel()*1} bytes to {len(exponent_compression.stream)} bytes."
+        )
+    else:
+        print("Exponent compression failed.")
+
+    if mantissa_compression.success:
+        print(
+            f"Mantissa compression successful: Compressed {module.weight.numel()*1} bytes to {len(mantissa_compression.stream)} bytes."
+        )
+    else:
+        print("Mantissa compression failed.")
 
     module.compressed = "rans_bfloat16"
 
@@ -169,8 +201,8 @@ def rans_compress_module_weight_int8(module: nn.Module) -> None:
             module.cdf = cdf
             module.freqs = freqs
 
-    size_in_bytes = module.weight.numel
-    memory_manager = _ccore.RansManager(module.weight.numel)
+    bytes_to_allocate = module.weight.numel()
+    memory_manager = ccore.RansManager(bytes_to_allocate)
 
     weight_np = module.weight.cpu().numpy()
     compression_result = memory_manager.compress(
@@ -220,9 +252,9 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         return
 
     # Manager handles the decoding logic
-    manager_exp = _ccore.RansManager(module.exponent_stream_size)
+    manager_exp = ccore.RansManager(module.exponent_stream_size)
 
-    raw_exponent = _ccore.allocate_pinned_memory(module.expanded_size)
+    raw_exponent = ccore.allocate_pinned_memory(module.expanded_size)
 
     _ = manager_exp.decompress(
         raw_exponent,  # Output buffer (Destination)
@@ -234,10 +266,10 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         module.exponent_cdf,
     )
 
-    manager_man = _ccore.RansManager(module.mantissa_stream_size)
+    manager_man = ccore.RansManager(module.mantissa_stream_size)
 
     # Output buffer for mantissas
-    raw_mantissa = _ccore.allocate_pinned_memory(module.expanded_size)
+    raw_mantissa = ccore.allocate_pinned_memory(module.expanded_size)
 
     _ = manager_man.decompress(
         raw_mantissa,
@@ -278,9 +310,9 @@ def rans_decompress_module_weight_int8(module: nn.Module) -> None:
         return
 
     # Reserve space for decompressed weight
-    manager = _ccore.RansManager(module.stream_size)
+    manager = ccore.RansManager(module.stream_size)
     # Allocate pinned memory for decompressed weight
-    pinned_stream = _ccore.allocate_pinned_memory(module.stream_size)
+    pinned_stream = ccore.allocate_pinned_memory(module.stream_size)
 
     _ = manager.decompress(
         pinned_stream,

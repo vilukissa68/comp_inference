@@ -32,7 +32,7 @@ RansManager::CompressResult RansManager::compress(
     CUDA_CHECK(cudaMemcpy(states_vec.data(), gpu_result.final_states, gpu_result.num_streams * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(sizes_vec.data(), gpu_result.output_sizes, gpu_result.num_streams * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    return { stream_vec, states_vec, sizes_vec, gpu_result.num_streams, gpu_result.stream_len };
+    return { gpu_result.success, stream_vec, states_vec, sizes_vec, gpu_result.num_streams, gpu_result.stream_len };
 }
 
 float RansManager::decompress(

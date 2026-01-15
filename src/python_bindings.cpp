@@ -31,6 +31,7 @@ PYBIND11_MODULE(ccore, m) {
     }, "Allocates a pinned numpy array");
 
     py::class_<RansManager::CompressResult>(m, "CompressResult")
+	  	.def_readonly("success", &RansManager::CompressResult::success)
         .def_property_readonly("stream", [](const RansManager::CompressResult& r) {
             return py::array_t<uint8_t>(r.stream.size(), r.stream.data());
         })

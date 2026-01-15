@@ -150,6 +150,7 @@ struct StreamConfigurator {
 
 template <typename Config>
 struct RansResultPointers {
+	bool success;
     const typename Config::io_t* stream;
     const typename Config::state_t* final_states;
     const uint32_t* output_sizes;
@@ -201,7 +202,9 @@ RansResultPointers<Config> rans_compress_cuda(
     rans_compress_kernel<Config><<<grid, block, 0, stream>>>(ctx);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+
     return {
+		ctx.success,
         ws.d_output,
         ws.d_states,
         ws.d_sizes,

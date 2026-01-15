@@ -80,7 +80,11 @@ __global__ void rans_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
                 ctx.output[out_idx * ctx.num_streams + gid] =
 					static_cast<io_t>(state & RansConfig::io_mask);
                 out_idx++;
-            }
+            } else {
+				printf("RANS Encode Overflow on stream %u\n", gid);
+				ctx.success = false;
+				break;
+			}
 
             state >>= RansConfig::io_bits;
         }
