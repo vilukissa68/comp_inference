@@ -103,7 +103,7 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.from_numpy(freqs), torch.from_numpy(cdf)
 
 
-def rans_compress_module_weight_bf16(module: nn.Module) -> None:
+def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> None:
     if not hasattr(module, "weight"):
         return
     if module.weight.dtype != torch.bfloat16:
@@ -127,19 +127,11 @@ def rans_compress_module_weight_bf16(module: nn.Module) -> None:
     print(module.exponent_cdf)
     print(module.mantissa_cdf)
 
-    bytes_to_allocate = module.weight.numel() * 10
+    bytes_to_allocate = module.weight.numel() * 2
     print(f"Allocating RANS memory manager with {bytes_to_allocate} bytes.")
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
     mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
     print("RANS memory manager allocated.")
-
-    print("Starting mantissa compression...")
-    mantissa_compression = mantissa_memory_manager.compress(
-        mantissa.cpu().numpy().astype(np.uint8),
-        module.mantissa_cdf.numpy(),
-        module.mantissa_freqs.numpy(),
-    )
-    print("Mantissa compression completed.")
 
     print("Starting exponent compression...")
     exponent_compression = exp_memory_manager.compress(
@@ -165,7 +157,18 @@ def rans_compress_module_weight_bf16(module: nn.Module) -> None:
         module.exponent = exponent  # Keep uncompressed
         print("Exponent compression failed.")
 
-    if mantissa_compression.success:
+    # NOTE: Mantissa compression is often skipped as it provides little benefit
+    mantissa_compression = None
+    if not skip_mantissa:
+        print("Starting mantissa compression...")
+        mantissa_compression = mantissa_memory_manager.compress(
+            mantissa.cpu().numpy().astype(np.uint8),
+            module.mantissa_cdf.numpy(),
+            module.mantissa_freqs.numpy(),
+        )
+        print("Mantissa compression completed.")
+
+    if mantissa_compression and mantissa_compression.success:
         # Compression was beneficial, save results
         module.mantissa_compressed_weight = torch.from_numpy(
             mantissa_compression.stream
