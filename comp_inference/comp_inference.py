@@ -36,6 +36,7 @@ def reconstruct_from_exp_and_mantissa(
 ):
     # Ensure inputs are int32 for bitwise ops
     exponent = exponent.to(torch.int32)
+    exponent = exponent
     mantissa_and_sign = mantissa_and_sign.to(torch.int32)
 
     # Hardcoded for BF16 (8 exp, 7 man)
@@ -113,45 +114,36 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         return
 
     exponent, mantissa = extract_exp_and_mantissa(module.weight)
-    print("Extracted exponent and mantissa from bf16 weights.")
 
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
-    print("Computed rANS LUTs for exponent.")
     module.mantissa_freqs, module.mantissa_cdf = get_rans_lut(mantissa.to(torch.uint8))
-    print("Computed rANS LUTs for mantissa.")
 
-    print(f"== Freqs ==")
-    print(module.exponent_freqs)
-    print(module.mantissa_freqs)
-    print(f"== CDFs ==")
-    print(module.exponent_cdf)
-    print(module.mantissa_cdf)
+    bytes_to_allocate = module.weight.numel()
 
-    bytes_to_allocate = module.weight.numel() * 2
     print(f"Allocating RANS memory manager with {bytes_to_allocate} bytes.")
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
     mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
-    print("RANS memory manager allocated.")
 
-    print("Starting exponent compression...")
     exponent_compression = exp_memory_manager.compress(
         exponent.cpu().numpy().astype(np.uint8),
-        module.exponent_cdf.numpy(),
         module.exponent_freqs.numpy(),
+        module.exponent_cdf.numpy(),
     )
-    print("Exponent compression completed.")
 
     if exponent_compression.success:
+        # NOTE: This is probably a problem if streams are different sizes
         module.exponent_compressed_weight = torch.from_numpy(
             exponent_compression.stream
         )
         module.exponent_states = exponent_compression.states
+        module.exponent_output_sizes = exponent_compression.output_sizes
         module.exponent_num_streams = exponent_compression.num_streams
-        module.exponent_stream_size = len(exponent_compression.stream)
-        module.exponent_output_size = exponent_compression.output_size
+        module.exponent_total_stream_size = len(exponent_compression.stream)
+
+        compressed_size = sum(exponent_compression.output_sizes)
 
         print(
-            f"Exponent compression successful: Compressed {module.weight.numel()*1} bytes to {len(exponent_compression.stream)} bytes."
+            f"Exponent compression successful: Compressed {module.weight.numel()} bytes to {compressed_size} bytes."
         )
     else:
         module.exponent = exponent  # Keep uncompressed
@@ -163,8 +155,8 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         print("Starting mantissa compression...")
         mantissa_compression = mantissa_memory_manager.compress(
             mantissa.cpu().numpy().astype(np.uint8),
-            module.mantissa_cdf.numpy(),
             module.mantissa_freqs.numpy(),
+            module.mantissa_cdf.numpy(),
         )
         print("Mantissa compression completed.")
 
@@ -175,17 +167,17 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         )
         module.mantissa_states = mantissa_compression.states
         module.mantissa_num_streams = mantissa_compression.num_streams
-        module.mantissa_stream_size = len(mantissa_compression.stream)
-        module.mantissa_output_size = mantissa_compression.output_size
+        module.mantissa_total_stream_size = len(mantissa_compression.stream)
+        module.mantissa_output_sizes = mantissa_compression.output_sizes
 
         print(
-            f"Mantissa compression successful: Compressed {module.weight.numel()*1} bytes to {len(mantissa_compression.stream)} bytes."
+            f"Mantissa compression successful: Compressed {module.weight.numel()} bytes to {len(mantissa_compression.stream)} bytes."
         )
     else:
         module.mantissa = mantissa  # Keep uncompressed
         print("Mantissa compression failed.")
 
-    if exponent_compression.success or mantissa_compression.success:
+    if hasattr(module, "mantissa_compressed_weight") or hasattr(module, "exponent_compressed_weight"):
         # Some benefit to compression, mark module as compressed
         module.compressed = "rans_bfloat16"
         module.expanded_size = module.weight.numel()
@@ -263,36 +255,44 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     # Check if exponents where compressed
 
     if hasattr(module, "exponent_compressed_weight"):
-        manager_exp = ccore.RansManager(module.exponent_stream_size)
+        manager_exp = ccore.RansManager(module.expanded_size)
 
         raw_exponent = ccore.allocate_pinned_memory(module.expanded_size)
+        input_buffer = ccore.allocate_pinned_memory(module.expanded_size * 1.5)
+        input_buffer_view = input_buffer[: module.exponent_total_stream_size]
 
-        _ = manager_exp.decompress(
-            raw_exponent,  # Output buffer (Destination)
+        np.copyto(
+            input_buffer_view,
+            module.exponent_compressed_weight.numpy(),
+        )
+
+        _ = manager_exp.decompress_into(
+            input_buffer_view,  # Input buffer (Source)
             module.exponent_states,  # Initial states for parallel streams
-            module.exponent_output_size,
+            module.exponent_output_sizes,
             module.exponent_num_streams,
             module.expanded_size,
             module.exponent_freqs,
             module.exponent_cdf,
+            raw_exponent,  # Output buffer (Destination)
         )
     else:
         raw_exponent = module.exponent
 
     if not hasattr(module, "mantissa_compressed_weight"):
-        manager_man = ccore.RansManager(module.mantissa_stream_size)
+        manager_man = ccore.RansManager(module.expanded_size)
 
         # Output buffer for mantissas
         raw_mantissa = ccore.allocate_pinned_memory(module.expanded_size)
 
         _ = manager_man.decompress(
             raw_mantissa,
-            module.mantissa_states,
-            module.mantissa_output_size,
-            module.mantissa_num_streams,
-            module.expanded_size,
-            module.mantissa_freqs,
-            module.mantissa_cdf,
+            module.mantissa_states, # End states
+            module.mantissa_output_sizes, # Lengths of each stream
+            module.mantissa_num_streams, # Number of streams
+            module.expanded_size, # Total expected output size
+            module.mantissa_freqs, # Frequency table
+            module.mantissa_cdf, # CDF table
         )
     else:
         raw_mantissa = module.mantissa

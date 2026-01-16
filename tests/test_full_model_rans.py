@@ -60,6 +60,8 @@ if __name__ == "__main__":
 
                 # Verify shape restoration
                 assert hasattr(module, "weight"), f"Decompression failed for {name}"
+            else:
+                print(f"Warning: Compression did not occur for {name}")
 
     print(f"Processed {compressed_count} layers.")
 
@@ -83,3 +85,27 @@ if __name__ == "__main__":
         print("\n❌ FAILURE: Outputs do not match.")
         diff = (original_output - decompressed_output).abs().max()
         print(f"Max difference: {diff}")
+
+    # Convert output to text
+    original_text = tokenizer.decode(torch.argmax(original_output, dim=-1)[0])
+    decompressed_text = tokenizer.decode(torch.argmax(decompressed_output, dim=-1)[0])
+    print(f"\nOriginal Output Text: {original_text}")
+    print(f"Decompressed Output Text: {decompressed_text}")
+
+
+    # Reload the model and verify all the parameters are back to original
+    print("\nReloading model to verify parameter integrity...")
+    reloaded_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        dtype=torch.bfloat16,
+    )
+    reloaded_model.to("cpu")
+    mismatch_count = 0
+    for (name1, param1), (name2, param2) in zip(model.named_parameters(), reloaded_model.named_parameters()):
+        if not torch.equal(param1, param2):
+            mismatch_count += 1
+            print(f"Parameter mismatch: {name1} vs {name2}")
+    if mismatch_count == 0:
+        print("✅ All parameters match the reloaded model.")
+    else:
+        print(f"❌ {mismatch_count} parameters did not match the reloaded model.")

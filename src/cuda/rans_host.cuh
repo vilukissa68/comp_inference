@@ -136,15 +136,27 @@ struct StreamConfigurator {
             rans_compress_kernel<Config>, 
             0, 0);
 
-        uint32_t target_chunk_size = 4096; 
-        uint32_t suggested_streams = (total_data_size + target_chunk_size - 1) / target_chunk_size;
-        uint32_t min_streams_for_saturation = prop.multiProcessorCount * 4 * best_block_size;
+        // CONFIGURATION:
+        // rANS needs a decent chunk size to amortize the state headers.
+        // 4KB is a safe minimum. 32KB is often better for ratio.
+        uint32_t min_chunk_size = 4096; 
         
-        if (suggested_streams < min_streams_for_saturation) suggested_streams = min_streams_for_saturation;
-        suggested_streams = std::min((uint32_t)total_data_size, suggested_streams);
-        if (suggested_streams == 0) suggested_streams = 1;
+        // Calculate max streams allowed by data size
+        uint32_t calculated_streams = (total_data_size + min_chunk_size - 1) / min_chunk_size;
 
-        return { best_block_size, suggested_streams };
+        // Calculate hardware ceiling
+        uint32_t hardware_limit = prop.multiProcessorCount * 32 * best_block_size;
+
+        // Select the smaller of the two
+        uint32_t final_streams = calculated_streams;
+
+        // Ensure at least 1 stream
+        if (final_streams == 0) final_streams = 1;
+        
+        // Ensure we don't have more streams than bytes
+        if (final_streams > total_data_size) final_streams = total_data_size;
+
+        return { best_block_size, final_streams };
     }
 };
 
@@ -198,6 +210,16 @@ RansResultPointers<Config> rans_compress_cuda(
 
     int block = k_conf.block_size;
     int grid = (num_streams + block - 1) / block;
+	ctx.success = true;
+
+	// Log ctx
+	std::cout << "RANS Compression Context:\n";
+	std::cout << "  Num streams: " << ctx.num_streams << "\n";
+	std::cout << "  Symbols per stream: " << syms_per_stream << "\n";
+	std::cout << "  Stream capacity (io_t): " << ctx.stream_capacity << "\n";
+	std::cout << "  Input size (symbols): " << ctx.input_size << "\n";
+	std::cout << "  Total output buffer size (bytes): " << (size_t)num_streams * capacity * sizeof(io_t) << "\n";
+	std::cout << "  Launching kernel with grid: " << grid << ", block: " << block << "\n";
 
     rans_compress_kernel<Config><<<grid, block, 0, stream>>>(ctx);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -205,11 +227,11 @@ RansResultPointers<Config> rans_compress_cuda(
 
     return {
 		ctx.success,
-        ws.d_output,
-        ws.d_states,
-        ws.d_sizes,
-        num_streams,
-        (size_t)num_streams * capacity
+        ws.d_output, // Compressed stream
+        ws.d_states, // Final states
+        ws.d_sizes, // Length of each stream
+        num_streams, // Number of streams
+        (size_t)num_streams * capacity // Total allocated stream length in bytes
     };
 }
 
@@ -263,6 +285,14 @@ std::pair<const typename Config::symbol_t*, float> rans_decompress_cuda(
     ctx.num_streams = num_streams;
     ctx.tables.sym_info = ws.d_sym_info;
     ctx.tables.slot_to_sym = ws.d_slot_map;
+
+	// Log ctx
+	std::cout << "RANS Decompression Context:\n";
+	std::cout << "  Num streams: " << num_streams << "\n";
+	std::cout << "  Symbols per stream: " << symbols_per_stream << "\n";
+	std::cout << "  Stream capacity (io_t): " << capacity_per_stream << "\n";
+	std::cout << "  Input size (bytes): " << input_bytes << "\n";
+	std::cout << "  Output size (symbols): " << (output_bytes / sizeof(symbol_t)) << "\n";
 
     int min_grid, best_block;
     cudaOccupancyMaxPotentialBlockSize(&min_grid, &best_block, rans_decompress_kernel<Config>, 0, 0);
