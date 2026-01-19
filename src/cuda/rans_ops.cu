@@ -35,6 +35,7 @@ RansManager::CompressResult RansManager::compress(
     return { gpu_result.success, stream_vec, states_vec, sizes_vec, gpu_result.num_streams, gpu_result.stream_len };
 }
 
+
 float RansManager::decompress(
     const uint8_t* stream,
     size_t stream_size,

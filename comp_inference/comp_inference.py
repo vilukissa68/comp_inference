@@ -25,7 +25,7 @@ def extract_exp_and_mantissa(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.
     exponent = (raw >> mantissa_bits) & ((1 << exp_bits) - 1)
     mantissa = raw & ((1 << mantissa_bits) - 1)
 
-    exponent = exponent - bias
+    exponent = exponent# - bias
     mantissa = (sign << mantissa_bits) | mantissa
     return exponent.to(torch.uint8), (mantissa).to(torch.uint8)
 
@@ -48,7 +48,7 @@ def reconstruct_from_exp_and_mantissa(
 
     # Re-bias exponent (You subtracted bias during compression)
     # BF16 bias is 127
-    exponent_raw = exponent + 127
+    exponent_raw = exponent
 
     # Assemble bits: S << 15 | E << 7 | M
     bits = (sign << 15) | (exponent_raw << 7) | mantissa
@@ -101,7 +101,7 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         cdf[i] = running_sum
         running_sum += freqs[i]
 
-    return torch.from_numpy(freqs), torch.from_numpy(cdf)
+    return torch.from_numpy(freqs).to(torch.uint16), torch.from_numpy(cdf).to(torch.uint16)
 
 
 def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> None:
@@ -124,21 +124,45 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
     mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
 
+    # exponent_compression = exp_memory_manager.compress(
+    #     exponent.cpu().numpy().astype(np.uint8),
+    #     module.exponent_freqs.numpy(),
+    #     module.exponent_cdf.numpy(),
+    # )
+
+    print("Exponent type:", exponent.dtype)
+    print("Exponent type():", type(exponent))
+    print("Exponent freqs type:", module.exponent_freqs.dtype)
+    print("Exponent fresqs type():", type(module.exponent_freqs))
+    print("Exponent cdf type:", module.exponent_cdf.dtype)
+    print("Exponent cdf type():", type(module.exponent_cdf))
+
     exponent_compression = exp_memory_manager.compress(
-        exponent.cpu().numpy().astype(np.uint8),
-        module.exponent_freqs.numpy(),
-        module.exponent_cdf.numpy(),
-    )
+        exponent,
+        module.exponent_freqs,
+        module.exponent_cdf
+    )   
+
+    # Debug exponent compression result
+    print("Exponent compression result type:", type(exponent_compression))
+    print("Exponent compression stream type:", type(exponent_compression.stream))
+    print("Exponent compression success:", exponent_compression.success)
+    print("Exponent compression stream length:", len(exponent_compression.stream))
+    print("Exponent compression output sizes:", exponent_compression.output_sizes)
+    print("Exponent compression num streams:", exponent_compression.num_streams)
+    print("Exponent compression states type:", type(exponent_compression.states))
 
     if exponent_compression.success:
         # NOTE: This is probably a problem if streams are different sizes
-        module.exponent_compressed_weight = torch.from_numpy(
-            exponent_compression.stream
-        )
+        # module.exponent_compressed_weight = torch.from_numpy(
+        #     exponent_compression.stream
+        # )
+        module.exponent_compressed_weight = exponent_compression.stream
         module.exponent_states = exponent_compression.states
         module.exponent_output_sizes = exponent_compression.output_sizes
         module.exponent_num_streams = exponent_compression.num_streams
         module.exponent_total_stream_size = len(exponent_compression.stream)
+        module.exponent_shape = module.weight.shape
 
         compressed_size = sum(exponent_compression.output_sizes)
 
@@ -153,11 +177,17 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     mantissa_compression = None
     if not skip_mantissa:
         print("Starting mantissa compression...")
+        # mantissa_compression = mantissa_memory_manager.compress(
+        #     mantissa.cpu().numpy().astype(np.uint8),
+        #     module.mantissa_freqs.numpy(),
+        #     module.mantissa_cdf.numpy(),
+        # )
         mantissa_compression = mantissa_memory_manager.compress(
-            mantissa.cpu().numpy().astype(np.uint8),
-            module.mantissa_freqs.numpy(),
-            module.mantissa_cdf.numpy(),
+            mantissa,
+            module.mantissa_freqs,
+            module.mantissa_cdf,
         )
+
         print("Mantissa compression completed.")
 
     if mantissa_compression and mantissa_compression.success:
@@ -169,6 +199,7 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         module.mantissa_num_streams = mantissa_compression.num_streams
         module.mantissa_total_stream_size = len(mantissa_compression.stream)
         module.mantissa_output_sizes = mantissa_compression.output_sizes
+        module.mantissa_shape = module.weight.shape
 
         print(
             f"Mantissa compression successful: Compressed {module.weight.numel()} bytes to {len(mantissa_compression.stream)} bytes."
@@ -257,21 +288,29 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if hasattr(module, "exponent_compressed_weight"):
         manager_exp = ccore.RansManager(module.expanded_size)
 
-        raw_exponent = ccore.allocate_pinned_memory(module.expanded_size)
-        input_buffer = ccore.allocate_pinned_memory(module.expanded_size * 1.5)
+        raw_exponent = ccore.allocate_pinned_tensor(module.expanded_size)
+        input_buffer = ccore.allocate_pinned_tensor(module.exponent_total_stream_size)
         input_buffer_view = input_buffer[: module.exponent_total_stream_size]
 
-        np.copyto(
-            input_buffer_view,
-            module.exponent_compressed_weight.numpy(),
-        )
+        input_buffer_view.copy_(module.exponent_compressed_weight)
+        
+
+        # Debug, print decompress into parameter types
+        print("Input buffer view type:", type(input_buffer_view))
+        print("Exponent states type:", type(module.exponent_states))
+        print("Exponent output sizes type:", type(module.exponent_output_sizes))
+        print("Exponent num streams type:", type(module.exponent_num_streams))
+        print("Expanded size type:", type(module.expanded_size))
+        print("Exponent freqs type:", type(module.exponent_freqs))
+        print("Exponent cdf type:", type(module.exponent_cdf))
+        print("Raw exponent type:", type(raw_exponent))
+
 
         _ = manager_exp.decompress_into(
             input_buffer_view,  # Input buffer (Source)
             module.exponent_states,  # Initial states for parallel streams
             module.exponent_output_sizes,
             module.exponent_num_streams,
-            module.expanded_size,
             module.exponent_freqs,
             module.exponent_cdf,
             raw_exponent,  # Output buffer (Destination)
@@ -279,7 +318,7 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     else:
         raw_exponent = module.exponent
 
-    if not hasattr(module, "mantissa_compressed_weight"):
+    if hasattr(module, "mantissa_compressed_weight"):
         manager_man = ccore.RansManager(module.expanded_size)
 
         # Output buffer for mantissas
@@ -295,18 +334,23 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
             module.mantissa_cdf, # CDF table
         )
     else:
-        raw_mantissa = module.mantissa
+        raw_mantissa = module.mantissa.flatten()
 
     # Reconstruct bf16 weights
     decompressed_flat = reconstruct_from_exp_and_mantissa(
         raw_exponent, raw_mantissa, dtype=torch.bfloat16
     )
 
-    if hasattr(module, "input_shape"):
-        module.weight = decompressed_flat.reshape(module.input_shape)
+    # Looks for shape information
+    shape = None
+    if hasattr(module, "exponent_shape"):
+        shape = module.exponent_shape
+    elif hasattr(module, "mantissa_shape"):
+        shape = module.mantissa_shape
     else:
-        print("Warning: 'input_shape' not found in module. Weight will be flat.")
-        module.weight = decompressed_flat
+        shape = (module.expanded_size,)
+
+    module.weight = decompressed_flat.reshape(shape)
 
     print(f"Success: Decompressed bf16 weights. Shape: {module.weight.shape}")
 

@@ -249,6 +249,15 @@ std::pair<const typename Config::symbol_t*, float> rans_decompress_cuda(
     using symbol_t = typename Config::symbol_t;
     using sym_info_t = typename Config::sym_info_t;
 
+	// NOTE: This allocation should be handeld in python
+    if (ws.d_sym_info == nullptr) {
+		std::cout << "Ws.d_sym_info is null, allocating...\n";
+        CUDA_CHECK(cudaMalloc(&ws.d_sym_info, Config::vocab_size * sizeof(sym_info_t)));
+    }
+    if (ws.d_slot_map == nullptr) {
+		std::cout << "Ws.d_slot_map is null, allocating...\n";
+        CUDA_CHECK(cudaMalloc(&ws.d_slot_map, Config::prob_scale * sizeof(symbol_t)));
+    }
     uint32_t capacity_per_stream = stream_size_bytes / num_streams;
 
     std::vector<sym_info_t> host_sym_info(Config::vocab_size);
