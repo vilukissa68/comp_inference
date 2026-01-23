@@ -3,7 +3,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 
-from comp_inference import rans_compress_module_weight, rans_decompress_module_weight
+from comp_inference import rans_compress_module_weight, rans_decompress_module_weight, save_compressed_model, load_compressed_model_with_auto_model
 
 if __name__ == "__main__":
     print("=== Full Model Round-Trip rANS Compression Test ===")
@@ -49,19 +49,33 @@ if __name__ == "__main__":
             # A. Compress
             # This deletes module.weight and creates module.compressed_weight + LUTs
             rans_compress_module_weight(module)
+            if not hasattr(module, "compressed"):
+                print(f"Warning: Compression failed for {name}")
+    print("Compression phase completed.")
+    save_compressed_model(model, "compressed_model.pth")
+    del model  # Free memory
 
-            # Check if compression actually happened
-            if hasattr(module, "compressed"):
-                compressed_count += 1
+    # Read back the compressed model
+    model = load_compressed_model_with_auto_model(
+        model_name,
+        "compressed_model.pth",
+        device="cpu",
+    )
 
-                # B. Decompress
-                # This reads compressed_weight + LUTs and recreates module.weight
-                rans_decompress_module_weight(module)
+    print("Model reloaded from compressed file.")
 
-                # Verify shape restoration
-                assert hasattr(module, "weight"), f"Decompression failed for {name}"
-            else:
-                print(f"Warning: Compression did not occur for {name}")
+            
+    for name, module in model.named_modules():
+        # Check if compression actually happened
+        if hasattr(module, "compressed"):
+            compressed_count += 1
+
+            # B. Decompress
+            # This reads compressed_weight + LUTs and recreates module.weight
+            rans_decompress_module_weight(module)
+
+            # Verify shape restoration
+            assert hasattr(module, "weight"), f"Decompression failed for {name}"
 
     print(f"Processed {compressed_count} layers.")
 
@@ -105,6 +119,8 @@ if __name__ == "__main__":
         if not torch.equal(param1, param2):
             mismatch_count += 1
             print(f"Parameter mismatch: {name1} vs {name2}")
+            print(f"Original param: {param1}")
+            print(f"Reloaded param: {param2}")
     if mismatch_count == 0:
         print("✅ All parameters match the reloaded model.")
     else:

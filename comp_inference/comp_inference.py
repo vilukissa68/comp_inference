@@ -108,114 +108,71 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     if not hasattr(module, "weight"):
         return
     if module.weight.dtype != torch.bfloat16:
-        print(
-            f"Module weight dtype is {module.weight.dtype}, expected bfloat16. Can't compress with bf16 method. Skipping."
-        )
+        print(f"Skipping {module.weight.dtype}, expected bfloat16.")
         return
 
+    # 1. Save original metadata needed for reconstruction
+    # We save this BEFORE deleting the weight
+    module.input_shape = list(module.weight.shape)
+    module.expanded_size = module.weight.numel()
+
+    # 2. Extract
     exponent, mantissa = extract_exp_and_mantissa(module.weight)
 
+    # 3. Compute LUTs (Assuming get_rans_lut returns Tensors)
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
     module.mantissa_freqs, module.mantissa_cdf = get_rans_lut(mantissa.to(torch.uint8))
 
-    bytes_to_allocate = module.weight.numel()
-
-    print(f"Allocating RANS memory manager with {bytes_to_allocate} bytes.")
+    # 4. Allocate Managers
+    # Note: Allocating full size is safe but conservative.
+    bytes_to_allocate = module.expanded_size
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
-    mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
-
-    # exponent_compression = exp_memory_manager.compress(
-    #     exponent.cpu().numpy().astype(np.uint8),
-    #     module.exponent_freqs.numpy(),
-    #     module.exponent_cdf.numpy(),
-    # )
-
-    print("Exponent type:", exponent.dtype)
-    print("Exponent type():", type(exponent))
-    print("Exponent freqs type:", module.exponent_freqs.dtype)
-    print("Exponent fresqs type():", type(module.exponent_freqs))
-    print("Exponent cdf type:", module.exponent_cdf.dtype)
-    print("Exponent cdf type():", type(module.exponent_cdf))
-
+    
+    # --- EXPONENT COMPRESSION ---
+    print("Compressing Exponent...")
     exponent_compression = exp_memory_manager.compress(
-        exponent,
+        exponent, # Tensor (uint8)
         module.exponent_freqs,
         module.exponent_cdf
     )   
 
-    # Debug exponent compression result
-    print("Exponent compression result type:", type(exponent_compression))
-    print("Exponent compression stream type:", type(exponent_compression.stream))
-    print("Exponent compression success:", exponent_compression.success)
-    print("Exponent compression stream length:", len(exponent_compression.stream))
-    print("Exponent compression output sizes:", exponent_compression.output_sizes)
-    print("Exponent compression num streams:", exponent_compression.num_streams)
-    print("Exponent compression states type:", type(exponent_compression.states))
-
     if exponent_compression.success:
-        # NOTE: This is probably a problem if streams are different sizes
-        # module.exponent_compressed_weight = torch.from_numpy(
-        #     exponent_compression.stream
-        # )
+        # Direct assignment (Assuming C++ returns a Tensor now)
         module.exponent_compressed_weight = exponent_compression.stream
         module.exponent_states = exponent_compression.states
         module.exponent_output_sizes = exponent_compression.output_sizes
         module.exponent_num_streams = exponent_compression.num_streams
-        module.exponent_total_stream_size = len(exponent_compression.stream)
-        module.exponent_shape = module.weight.shape
-
-        compressed_size = sum(exponent_compression.output_sizes)
-
-        print(
-            f"Exponent compression successful: Compressed {module.weight.numel()} bytes to {compressed_size} bytes."
-        )
+        # We don't strictly need stream_size, we can use len(tensor)
     else:
-        module.exponent = exponent  # Keep uncompressed
-        print("Exponent compression failed.")
+        # Fallback: Store raw
+        module.exponent_raw = exponent 
+        print("Exponent compression failed. Storing raw.")
 
-    # NOTE: Mantissa compression is often skipped as it provides little benefit
+    # --- MANTISSA COMPRESSION ---
     mantissa_compression = None
     if not skip_mantissa:
-        print("Starting mantissa compression...")
-        # mantissa_compression = mantissa_memory_manager.compress(
-        #     mantissa.cpu().numpy().astype(np.uint8),
-        #     module.mantissa_freqs.numpy(),
-        #     module.mantissa_cdf.numpy(),
-        # )
+        print("Compressing Mantissa...")
+        mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
         mantissa_compression = mantissa_memory_manager.compress(
-            mantissa,
+            mantissa, # Tensor (uint8)
             module.mantissa_freqs,
             module.mantissa_cdf,
         )
 
-        print("Mantissa compression completed.")
-
     if mantissa_compression and mantissa_compression.success:
-        # Compression was beneficial, save results
-        module.mantissa_compressed_weight = torch.from_numpy(
-            mantissa_compression.stream
-        )
+        module.mantissa_compressed_weight = mantissa_compression.stream
         module.mantissa_states = mantissa_compression.states
-        module.mantissa_num_streams = mantissa_compression.num_streams
-        module.mantissa_total_stream_size = len(mantissa_compression.stream)
         module.mantissa_output_sizes = mantissa_compression.output_sizes
-        module.mantissa_shape = module.weight.shape
-
-        print(
-            f"Mantissa compression successful: Compressed {module.weight.numel()} bytes to {len(mantissa_compression.stream)} bytes."
-        )
+        module.mantissa_num_streams = mantissa_compression.num_streams
     else:
-        module.mantissa = mantissa  # Keep uncompressed
-        print("Mantissa compression failed.")
+        # Fallback: Store raw
+        # If skip_mantissa=True, we end up here too.
+        module.mantissa_raw = mantissa 
 
-    if hasattr(module, "mantissa_compressed_weight") or hasattr(module, "exponent_compressed_weight"):
-        # Some benefit to compression, mark module as compressed
-        module.compressed = "rans_bfloat16"
-        module.expanded_size = module.weight.numel()
-
-        # Delete original weight to save memory
-        del module.weight
-
+    # Cleanup
+    module.compressed = "rans_bfloat16"
+    del module.weight
+    print(f"Compression complete. Original: {module.expanded_size*2} bytes.")
 
 def rans_compress_module_weight_int8(module: nn.Module) -> None:
     """
@@ -272,88 +229,87 @@ def rans_compress_module_weight(module: nn.Module) -> None:
             f"Module weight dtype is {module.weight.dtype}, not supported for RANS compression. Skipping."
         )
 
-
 def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if not hasattr(module, "compressed"):
         print("Module is not compressed. Skipping decompression.")
         return
     if module.compressed != "rans_bfloat16":
-        print(
-            f"Module is compressed with {module.compressed}, not rans_bfloat16. Skipping."
-        )
+        print(f"Skipping {module.compressed}, expected rans_bfloat16.")
         return
 
-    # Check if exponents where compressed
-
     if hasattr(module, "exponent_compressed_weight"):
-        manager_exp = ccore.RansManager(module.expanded_size)
-
+        # Create output buffer
         raw_exponent = ccore.allocate_pinned_tensor(module.expanded_size)
-        input_buffer = ccore.allocate_pinned_tensor(module.exponent_total_stream_size)
-        input_buffer_view = input_buffer[: module.exponent_total_stream_size]
-
-        input_buffer_view.copy_(module.exponent_compressed_weight)
         
+        # Instantiate Manager
+        manager_exp = ccore.RansManager(len(module.exponent_compressed_weight))
 
-        # Debug, print decompress into parameter types
-        print("Input buffer view type:", type(input_buffer_view))
-        print("Exponent states type:", type(module.exponent_states))
-        print("Exponent output sizes type:", type(module.exponent_output_sizes))
-        print("Exponent num streams type:", type(module.exponent_num_streams))
-        print("Expanded size type:", type(module.expanded_size))
-        print("Exponent freqs type:", type(module.exponent_freqs))
-        print("Exponent cdf type:", type(module.exponent_cdf))
-        print("Raw exponent type:", type(raw_exponent))
-
-
+        # Decompress
         _ = manager_exp.decompress_into(
-            input_buffer_view,  # Input buffer (Source)
-            module.exponent_states,  # Initial states for parallel streams
-            module.exponent_output_sizes,
+            module.exponent_compressed_weight, # Stream
+            module.exponent_states.to(torch.int32), # Ensure Int32 for C++
+            module.exponent_output_sizes.to(torch.int32),
             module.exponent_num_streams,
             module.exponent_freqs,
             module.exponent_cdf,
-            raw_exponent,  # Output buffer (Destination)
+            raw_exponent # Destination
         )
     else:
-        raw_exponent = module.exponent
+        # Fallback: Check for raw attribute
+        if hasattr(module, "exponent_raw"):
+            raw_exponent = module.exponent_raw.flatten()
+        elif hasattr(module, "exponent"): # Legacy check
+            raw_exponent = module.exponent.flatten()
+        else:
+            raise RuntimeError(f"Missing exponent data for {module}")
 
     if hasattr(module, "mantissa_compressed_weight"):
-        manager_man = ccore.RansManager(module.expanded_size)
+        # Create output buffer
+        raw_mantissa = ccore.allocate_pinned_tensor(module.expanded_size)
+        
+        # Instantiate Manager
+        manager_man = ccore.RansManager(module.mantissa_stream_size)
 
-        # Output buffer for mantissas
-        raw_mantissa = ccore.allocate_pinned_memory(module.expanded_size)
-
-        _ = manager_man.decompress(
-            raw_mantissa,
-            module.mantissa_states, # End states
-            module.mantissa_output_sizes, # Lengths of each stream
-            module.mantissa_num_streams, # Number of streams
-            module.expanded_size, # Total expected output size
-            module.mantissa_freqs, # Frequency table
-            module.mantissa_cdf, # CDF table
+        # Decompress
+        _ = manager_man.decompress_into(
+            module.mantissa_compressed_weight,
+            module.mantissa_states.to(torch.int32),
+            module.mantissa_output_sizes.to(torch.int32),
+            module.mantissa_num_streams,
+            module.mantissa_freqs,
+            module.mantissa_cdf,
+            raw_mantissa # Destination
         )
     else:
-        raw_mantissa = module.mantissa.flatten()
+        # Fallback
+        if hasattr(module, "mantissa_raw"):
+            raw_mantissa = module.mantissa_raw.flatten()
+        elif hasattr(module, "mantissa"):
+            raw_mantissa = module.mantissa.flatten()
+        else:
+            raise RuntimeError(f"Missing mantissa data for {module}")
 
-    # Reconstruct bf16 weights
+    # Reconstruct tensor (Exp Tensor + Mantissa Tensor -> Tensor)
     decompressed_flat = reconstruct_from_exp_and_mantissa(
-        raw_exponent, raw_mantissa, dtype=torch.bfloat16
+        raw_exponent, 
+        raw_mantissa, 
+        dtype=torch.bfloat16
     )
 
-    # Looks for shape information
-    shape = None
-    if hasattr(module, "exponent_shape"):
+    # Determine Shape
+    if hasattr(module, "input_shape"):
+        shape = module.input_shape
+    elif hasattr(module, "exponent_shape"):
         shape = module.exponent_shape
-    elif hasattr(module, "mantissa_shape"):
-        shape = module.mantissa_shape
     else:
+        # Dangerous fallback, but prevents crash if shape lost
         shape = (module.expanded_size,)
+        print(f"Warning: No shape found for {module}, keeping flat.")
 
+    # Assign final weight
     module.weight = decompressed_flat.reshape(shape)
 
-    print(f"Success: Decompressed bf16 weights. Shape: {module.weight.shape}")
-
+    print(f"Success: Decompressed. Shape: {module.weight.shape}")
 
 def rans_decompress_module_weight_int8(module: nn.Module) -> None:
     """Decompress the module's weight using RANS and restore it to weight."""
@@ -418,3 +374,225 @@ def rans_decompress_module_weight(module: nn.Module) -> None:
     # and not just a buffer.
     if not isinstance(module.weight, nn.Parameter):
         module.weight = nn.Parameter(module.weight, requires_grad=False)
+
+import torch
+from safetensors.torch import save_file
+
+def save_compressed_model(model, output_path: str):
+    from safetensors.torch import save_file
+    tensors = {}
+    print(f"Packing model to {output_path}...")
+
+    for name, module in model.named_modules():
+        # --- Handle Compressed Layers ---
+        if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
+            
+            # Check types
+            print(f"exponent_states dtype: {module.exponent_states.dtype}")
+            print(f"exponent_output_sizes dtype: {module.exponent_output_sizes.dtype}")
+            print(f"exponent_freqs dtype: {module.exponent_freqs.dtype}")
+            print(f"exponent_cdf dtype: {module.exponent_cdf.dtype}")
+            
+            # 1. Pack Exponent
+            if hasattr(module, "exponent_compressed_weight"):
+                tensors[f"{name}.rans_exp_stream"] = module.exponent_compressed_weight.cpu()
+                tensors[f"{name}.rans_exp_states"] = module.exponent_states.cpu()#.to(torch.int32)
+                tensors[f"{name}.rans_exp_sizes"]  = module.exponent_output_sizes.cpu()#.to(torch.int32)
+                tensors[f"{name}.rans_exp_freqs"]  = module.exponent_freqs.cpu()#.to(torch.int16)
+                tensors[f"{name}.rans_exp_cdf"]    = module.exponent_cdf.cpu()#.to(torch.int16)
+                exp_streams = module.exponent_num_streams
+                is_exp_compressed = 1
+            else:
+                # Fallback: Exponent is raw
+                tensors[f"{name}.rans_exp_raw"] = module.exponent_raw.cpu()
+                exp_streams = 0
+                is_exp_compressed = 0
+
+            # 2. Pack Mantissa
+            if hasattr(module, "mantissa_compressed_weight"):
+                tensors[f"{name}.rans_man_stream"] = module.mantissa_compressed_weight.cpu()
+                tensors[f"{name}.rans_man_states"] = module.mantissa_states.cpu().to(torch.int32)
+                tensors[f"{name}.rans_man_sizes"]  = module.mantissa_output_sizes.cpu().to(torch.int32)
+                tensors[f"{name}.rans_man_freqs"]  = module.mantissa_freqs.cpu().to(torch.int16)
+                tensors[f"{name}.rans_man_cdf"]    = module.mantissa_cdf.cpu().to(torch.int16)
+                man_streams = module.mantissa_num_streams
+                is_man_compressed = 1
+            else:
+                # Fallback: Mantissa is raw
+                # Flatten it to ensure 1D storage in safetensors implies data stream
+                tensors[f"{name}.rans_man_raw"] = module.mantissa_raw.cpu().flatten()
+                man_streams = 0
+                is_man_compressed = 0
+
+            # 3. Create Info Tensor (The "Header")
+            # We need to save the shape and num_streams.
+            # Layout: [Version, ExpandedSize, ExpStreams, ManStreams, ShapeRank, Dim0, Dim1...]
+            
+            shape = getattr(module, "input_shape", [])
+            if not shape and hasattr(module, "expanded_size"):
+                # Fallback guess if shape missing
+                shape = [module.expanded_size] 
+
+            info_data = [
+                1, # Format Version
+                module.expanded_size,
+                is_exp_compressed,
+                exp_streams,
+                is_man_compressed,
+                man_streams,
+                len(shape)
+            ] + list(shape)
+
+            tensors[f"{name}.rans_info"] = torch.tensor(info_data, dtype=torch.int32)
+
+            # 4. Save Bias (if present)
+            if hasattr(module, "bias") and module.bias is not None:
+                tensors[f"{name}.bias"] = module.bias.cpu()
+
+        else:
+            # Save standard parameters
+            for param_name, param in module.named_parameters(recurse=False):
+                # Check if we already handled this via the compressed path
+                if param_name == "weight" and hasattr(module, "compressed"):
+                    continue
+                
+                full_name = f"{name}.{param_name}" if name else param_name
+                tensors[full_name] = param.data.cpu()
+
+    # Metadata for the file header
+    metadata = {
+        "format": "pt",
+        "compression_method": "rans_bfloat16"
+    }
+
+    save_file(tensors, output_path, metadata=metadata)
+    print(f"Saved {len(tensors)} tensors.")
+
+def load_compressed_model_with_auto_model(model_name: str, safetensors_path: str, device="cpu"):
+    from transformers import AutoModelForCausalLM, AutoConfig
+
+    config = AutoConfig.from_pretrained(model_name)
+    with torch.device(device):
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+
+    load_compressed_model(model, safetensors_path, device=device)
+    return model
+
+
+def load_compressed_model(model: nn.Module, safetensors_path: str, device="cpu"):
+    """
+    Loads a rANS compressed model from a safetensors file into an initialized 
+    model skeleton.
+    """
+    from safetensors.torch import safe_open
+    print(f"Loading compressed model from {safetensors_path}...")
+    
+    with safe_open(safetensors_path, framework="pt", device=device) as f:
+        # Get all keys to allow fast lookups
+        file_keys = set(f.keys())
+        
+        loaded_count = 0
+        
+        for name, module in model.named_modules():
+            # 1. Check if this module has compressed metadata in the file
+            info_key = f"{name}.rans_info"
+            
+            if info_key in file_keys:
+                # --- LOAD COMPRESSED LAYER ---
+                _load_rans_layer(module, name, f)
+                loaded_count += 1
+            else:
+                # --- LOAD STANDARD PARAMETERS ---
+                # (Embeddings, LayerNorms, or uncompressed Linears)
+                for param_name, param in module.named_parameters(recurse=False):
+                    full_key = f"{name}.{param_name}" if name else param_name
+                    
+                    if full_key in file_keys:
+                        # Load data into existing parameter
+                        tensor = f.get_tensor(full_key)
+                        
+                        # Safety check for shape mismatch
+                        if param.shape != tensor.shape:
+                            print(f"Warning: Shape mismatch for {full_key}. Expected {param.shape}, got {tensor.shape}")
+                        
+                        param.data = tensor
+                    
+                    # Note: We ignore missing keys here because they might belong 
+                    # to a parent/child module handled in a different iteration.
+
+    print(f"Model loaded. {loaded_count} layers are compressed.")
+
+def _load_rans_layer(module: nn.Module, prefix: str, f):
+    """
+    Helper to populate specific attributes of a compressed module.
+    """
+    # 1. Parse Info Tensor
+    # Layout: [Version, ExpandedSize, ExpStreams, ManStreams, ShapeRank, Dim0, Dim1...]
+    info = f.get_tensor(f"{prefix}.rans_info")
+    
+    # Extract scalars (using .item() to get Python ints)
+    # version = info[0].item() # Unused for now
+    expanded_size = info[1].item()
+    is_exp_compressed = info[2].item()
+    exp_num_streams = info[3].item()
+    is_man_compressed = info[4].item()
+    man_num_streams = info[5].item()
+    shape_rank = info[6].item()
+    
+    # Reconstruct shape tuple
+    input_shape = torch.Size(info[7 : 7 + shape_rank].tolist())
+
+    # Set Module Attributes
+    module.compressed = "rans_bfloat16"
+    module.expanded_size = expanded_size
+    module.input_shape = input_shape
+
+    # 2. Load Exponent Data
+    if is_exp_compressed > 0:
+        module.exponent_compressed_weight = f.get_tensor(f"{prefix}.rans_exp_stream")
+        module.exponent_states = f.get_tensor(f"{prefix}.rans_exp_states")
+        module.exponent_output_sizes = f.get_tensor(f"{prefix}.rans_exp_sizes")
+        module.exponent_freqs = f.get_tensor(f"{prefix}.rans_exp_freqs")#.to(torch.uint16)
+        module.exponent_cdf = f.get_tensor(f"{prefix}.rans_exp_cdf")#.to(torch.uint16)
+        
+        module.exponent_num_streams = exp_num_streams
+        module.exponent_stream_size = module.exponent_compressed_weight.numel()
+        
+        # Calculate total stream size for the buffer view logic
+        # (This is usually just numel, but explicit check helps)
+        module.exponent_total_stream_size = module.exponent_stream_size
+    else:
+        # Fallback raw
+        if f"{prefix}.rans_exp_raw" in f.keys():
+            module.exponent_raw = f.get_tensor(f"{prefix}.rans_exp_raw")
+        else:
+            raise ValueError(f"Corrupt file: {prefix} marked uncompressed exponent but raw data missing.")
+
+    # 3. Load Mantissa Data
+    if is_man_compressed > 0:
+        module.mantissa_compressed_weight = f.get_tensor(f"{prefix}.rans_man_stream")
+        module.mantissa_states = f.get_tensor(f"{prefix}.rans_man_states")
+        module.mantissa_output_sizes = f.get_tensor(f"{prefix}.rans_man_sizes")
+        module.mantissa_freqs = f.get_tensor(f"{prefix}.rans_man_freqs").to(torch.uint16)
+        module.mantissa_cdf = f.get_tensor(f"{prefix}.rans_man_cdf").to(torch.uint16)
+        
+        module.mantissa_num_streams = man_num_streams
+        module.mantissa_stream_size = module.mantissa_compressed_weight.numel()
+        module.mantissa_total_stream_size = module.mantissa_stream_size
+    else:
+        # Fallback raw
+        if f"{prefix}.rans_man_raw" in f.keys():
+            module.mantissa_raw = f.get_tensor(f"{prefix}.rans_man_raw")
+        else:
+            raise ValueError(f"Corrupt file: {prefix} marked uncompressed mantissa but raw data missing.")
+
+    # 4. Load Bias (if present)
+    if f"{prefix}.bias" in f.keys():
+        if hasattr(module, 'bias') and module.bias is not None:
+            module.bias.data = f.get_tensor(f"{prefix}.bias")
+
+    # 5. CLEANUP: Delete the original weight
+    # The model skeleton initialized a random weight. We must delete it 
+    # to save memory and ensure the forward pass crashes if we forget to decompress.
+    if hasattr(module, "weight"):
+        del module.weight

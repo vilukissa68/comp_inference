@@ -1,6 +1,7 @@
 #include "rans.hpp" 
 #include "rans_host.cuh"   
 #include <vector>
+#include <cstring>
 
 struct RansWorkspaceWrapper {
     RansWorkspace<RansConfig8> internal;
@@ -24,15 +25,44 @@ RansManager::CompressResult RansManager::compress(
         ws->internal, data, size, freqs, cdf, config
     );
 
-    std::vector<uint8_t> stream_vec(gpu_result.stream_len);
+    //std::vector<uint8_t> stream_vec(gpu_result.stream_len);
     std::vector<uint32_t> states_vec(gpu_result.num_streams);
     std::vector<uint32_t> sizes_vec(gpu_result.num_streams);
 
-    CUDA_CHECK(cudaMemcpy(stream_vec.data(), gpu_result.stream, gpu_result.stream_len, cudaMemcpyDeviceToHost));
+    //CUDA_CHECK(cudaMemcpy(stream_vec.data(), gpu_result.stream, gpu_result.stream_len, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(states_vec.data(), gpu_result.final_states, gpu_result.num_streams * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(sizes_vec.data(), gpu_result.output_sizes, gpu_result.num_streams * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-    return { gpu_result.success, stream_vec, states_vec, sizes_vec, gpu_result.num_streams, gpu_result.stream_len };
+	// Find longest stream length
+	uint32_t max_len = 0;
+	for (uint32_t sz : sizes_vec) {
+		if (sz > max_len) {
+			max_len = sz;
+		}
+	}
+
+	// Allocate trimmed stream vector
+	size_t trimmed_size = (size_t)max_len * gpu_result.num_streams;
+    std::vector<uint8_t> stream_vec(trimmed_size);
+	
+
+	// Copy trimmed data from GPU
+	CUDA_CHECK(cudaMemcpy(
+		stream_vec.data(),
+		gpu_result.stream,
+		trimmed_size,
+		cudaMemcpyDeviceToHost
+	));
+
+
+	return { 
+        gpu_result.success, 
+        stream_vec, 
+        states_vec, 
+        sizes_vec, 
+        gpu_result.num_streams, 
+        stream_vec.size() // Return the TRIMMED size
+    };
 }
 
 

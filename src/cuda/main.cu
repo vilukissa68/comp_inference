@@ -258,7 +258,8 @@ PinnedVector<typename Config::symbol_t> rans_decompress_cuda(
     
     t_total.record_start(stream);
 
-    uint32_t capacity_per_stream = host_stream_data.size() / num_streams;
+    //uint32_t capacity_per_stream = host_stream_data.size() / num_streams;
+    utint32_t capacity_per_stream = stream_data.size() / num_streams;
 
     std::vector<sym_info_t> host_sym_info(Config::vocab_size);
     std::vector<symbol_t> host_slot_map(Config::prob_scale);

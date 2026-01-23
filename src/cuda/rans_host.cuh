@@ -139,7 +139,8 @@ struct StreamConfigurator {
         // CONFIGURATION:
         // rANS needs a decent chunk size to amortize the state headers.
         // 4KB is a safe minimum. 32KB is often better for ratio.
-        uint32_t min_chunk_size = 4096; 
+        //uint32_t min_chunk_size = 4096;
+        uint32_t min_chunk_size = 32768;
         
         // Calculate max streams allowed by data size
         uint32_t calculated_streams = (total_data_size + min_chunk_size - 1) / min_chunk_size;

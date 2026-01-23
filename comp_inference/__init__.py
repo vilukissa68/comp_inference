@@ -12,4 +12,7 @@ from .comp_inference import (
     get_rans_lut,
     rans_compress_module_weight,
     rans_decompress_module_weight,
+    save_compressed_model,
+    load_compressed_model,
+    load_compressed_model_with_auto_model,
 )
