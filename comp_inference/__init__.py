@@ -20,3 +20,5 @@ from .rans_saving import (
     load_compressed_model,
     load_compressed_model_with_auto_model,
 )
+
+from .rans_gguf import save_rans_model_gguf
