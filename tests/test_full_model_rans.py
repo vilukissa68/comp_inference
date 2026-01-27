@@ -3,7 +3,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 
-from comp_inference import rans_compress_module_weight, rans_decompress_module_weight, load_compressed_model_with_auto_model, pack_and_save_tensors, save_rans_model_package
+from comp_inference import rans_compress_module_weight, rans_decompress_module_weight, load_compressed_model_with_auto_model, pack_and_save_tensors, save_rans_model_package, save_rans_model_gguf
 
 if __name__ == "__main__":
     print("=== Full Model Round-Trip rANS Compression Test ===")
@@ -54,6 +54,7 @@ if __name__ == "__main__":
     print("Compression phase completed.")
     #pack_and_save_tensors(model, "compressed_model.safetensors")
     save_rans_model_package(model, tokenizer, "model")
+    save_rans_model_gguf(model, "compressed_model.gguf")
     del model  # Free memory
 
     # Read back the compressed model
