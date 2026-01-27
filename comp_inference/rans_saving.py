@@ -67,10 +67,10 @@ def pack_and_save_tensors(model, output_path: str):
             # 2. Pack Mantissa
             if hasattr(module, "mantissa_compressed_weight"):
                 tensors[f"{name}.rans_man_stream"] = module.mantissa_compressed_weight.cpu()
-                tensors[f"{name}.rans_man_states"] = module.mantissa_states.cpu().to(torch.int32)
-                tensors[f"{name}.rans_man_sizes"]  = module.mantissa_output_sizes.cpu().to(torch.int32)
-                tensors[f"{name}.rans_man_freqs"]  = module.mantissa_freqs.cpu().to(torch.int16)
-                tensors[f"{name}.rans_man_cdf"]    = module.mantissa_cdf.cpu().to(torch.int16)
+                tensors[f"{name}.rans_man_states"] = module.mantissa_states.cpu()#.to(torch.int32)
+                tensors[f"{name}.rans_man_sizes"]  = module.mantissa_output_sizes.cpu()#.to(torch.int32)
+                tensors[f"{name}.rans_man_freqs"]  = module.mantissa_freqs.cpu()#.to(torch.int16)
+                tensors[f"{name}.rans_man_cdf"]    = module.mantissa_cdf.cpu()#.to(torch.int16)
                 man_streams = module.mantissa_num_streams
                 is_man_compressed = 1
             else:
