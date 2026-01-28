@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-
-try:
+try:       
+    import torch
     from . import ccore
 except ImportError as e:
     # This helps debug if the compilation failed or the .so file is missing

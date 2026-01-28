@@ -52,15 +52,15 @@ if __name__ == "__main__":
             if not hasattr(module, "compressed"):
                 print(f"Warning: Compression failed for {name}")
     print("Compression phase completed.")
-    #pack_and_save_tensors(model, "compressed_model.safetensors")
+    pack_and_save_tensors(model, "compressed_model.safetensors")
     save_rans_model_package(model, tokenizer, "model")
-    save_rans_model_gguf(model, "compressed_model.gguf")
+    save_rans_model_gguf(model, tokenizer, "compressed_model.gguf", model_name)
     del model  # Free memory
 
     # Read back the compressed model
     model = load_compressed_model_with_auto_model(
         model_name,
-        "compressed_model.pth",
+        "compressed_model.safetensors",
         device="cpu",
     )
 
