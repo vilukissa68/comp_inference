@@ -104,6 +104,43 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
     return torch.from_numpy(freqs).to(torch.uint16), torch.from_numpy(cdf).to(torch.uint16)
 
+def rans_compress_qkv_fused(self_attn_module: nn.Module):
+    """
+    Fuse q_proj, k_proj, v_proj into a single qkv_proj and
+    compress it using rANS.
+    """
+
+    q = self_attn_module.q_proj.weight
+    k = self_attn_module.k_proj.weight
+    v = self_attn_module.v_proj.weight
+
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16
+    assert q.shape[1] == k.shape[1] == v.shape[1]
+
+    # Fuse QKV for vLLM
+    fused_weight = torch.cat([q, k, v], dim=0)
+
+    # Fake linear for reuse
+    qkv_proj = nn.Linear(
+        fused_weight.shape[1],
+        fused_weight.shape[0],
+        bias=False,
+        device=fused_weight.device,
+        dtype=fused_weight.dtype,
+    )
+    qkv_proj.weight = nn.Parameter(fused_weight)
+
+    # Compress fused linear
+    rans_compress_module_weight_bf16(qkv_proj)
+
+    # Attach to attention module
+    self_attn_module.qkv_proj = qkv_proj
+    self_attn_module.qkv_fused = True
+
+    # Remove unfused projections
+    del self_attn_module.q_proj
+    del self_attn_module.k_proj
+    del self_attn_module.v_proj
 
 def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> None:
     if not hasattr(module, "weight"):

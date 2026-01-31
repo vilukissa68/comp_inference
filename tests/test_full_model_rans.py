@@ -1,9 +1,12 @@
-#!/usr/bin/env python3
+#/usr/bin/env python3
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 
-from comp_inference import rans_compress_module_weight, rans_decompress_module_weight, load_compressed_model_with_auto_model, pack_and_save_tensors, save_rans_model_package, save_rans_model_gguf
+from comp_inference import rans_compress_module_weight, rans_decompress_module_weight, load_compressed_model_with_auto_model, pack_and_save_tensors, save_rans_model_package, save_rans_model_gguf, rans_compress_qkv_fused
+
+fuse_qkv = True
+fuse_gate_up = True
 
 if __name__ == "__main__":
     print("=== Full Model Round-Trip rANS Compression Test ===")
@@ -37,6 +40,19 @@ if __name__ == "__main__":
         if name == "model.embed_tokens":
             print("Skipping embedding layer.")
             continue
+
+        # QKV fusion
+        if hasattr(module, "q_proj") and hasattr(module, "k_proj") and hasattr(module, "v_proj") and fuse_qkv:
+            print(f"Fusing QKV for {name}")
+            rans_compress_qkv_fused(module)
+            continue
+
+        # Gate up fusion
+        if hasattr(module, "gate") and hasattr(module, "up") and fuse_gate_up:
+            print(f"Fusing gate and up for {name}")
+            rans_compress_gate_up_fused(module)
+            continue
+            
         # Only target modules with weights
         if hasattr(module, "weight") and module.weight is not None:
             # Optional: Skip 1D tensors (LayerNorm) if you only want to test Linear layers
