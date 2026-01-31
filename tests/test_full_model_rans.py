@@ -28,6 +28,9 @@ def main():
     parser.add_argument(
         "--fuse_gate_up", action="store_true", help="Enable Gate+Up fusion"
     )
+    parser.add_argument(
+        "--skip_embedding", action="store_true", help="Skip embedding layer compression"
+    )
     args = parser.parse_args()
 
     print("Full Model Round-Trip rANS Compression Test")
@@ -57,8 +60,8 @@ def main():
 
     for name, module in model.named_modules():
         print(f"Processing module: {name} ({type(module)})")
-        if name == "model.embed_tokens":
-            print("Skipping embedding layer.")
+        if name == "model.embed_tokens" and args.skip_embedding:
+            print("Skipping compressing embedding layer.")
             continue
 
         # QKV fusion
