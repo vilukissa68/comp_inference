@@ -26,7 +26,7 @@ def extract_exp_and_mantissa(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.
     exponent = (raw >> mantissa_bits) & ((1 << exp_bits) - 1)
     mantissa = raw & ((1 << mantissa_bits) - 1)
 
-    exponent = exponent# - bias
+    exponent = exponent  # - bias
     mantissa = (sign << mantissa_bits) | mantissa
     return exponent.to(torch.uint8), (mantissa).to(torch.uint8)
 
@@ -102,7 +102,10 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         cdf[i] = running_sum
         running_sum += freqs[i]
 
-    return torch.from_numpy(freqs).to(torch.uint16), torch.from_numpy(cdf).to(torch.uint16)
+    return torch.from_numpy(freqs).to(torch.uint16), torch.from_numpy(cdf).to(
+        torch.uint16
+    )
+
 
 def rans_compress_qkv_fused(self_attn_module: nn.Module):
     """
@@ -134,13 +137,50 @@ def rans_compress_qkv_fused(self_attn_module: nn.Module):
     rans_compress_module_weight_bf16(qkv_proj)
 
     # Attach to attention module
-    self_attn_module.qkv_proj = qkv_proj
+    # NOTE: We keep the name q_proj for compatibility with vLLM's naming
+    self_attn_module.q_proj = qkv_proj
     self_attn_module.qkv_fused = True
 
     # Remove unfused projections
-    del self_attn_module.q_proj
+    # del self_attn_module.q_proj
     del self_attn_module.k_proj
     del self_attn_module.v_proj
+
+
+def rans_compress_gate_up_fused(ffn_module: nn.Module):
+    """
+    Fuse gate_proj and up_proj into a single gate_up_proj and
+    compress it using rANS.
+    """
+    gate = ffn_module.gate_proj.weight
+    up = ffn_module.up_proj.weight
+    assert gate.dtype == up.dtype == torch.bfloat16
+
+    # Fuse Gate and Up
+    fused_weight = torch.cat([gate, up], dim=0)
+
+    # Fake linear for reuse
+    gate_up_proj = nn.Linear(
+        fused_weight.shape[1],
+        fused_weight.shape[0],
+        bias=False,
+        device=fused_weight.device,
+        dtype=fused_weight.dtype,
+    )
+    gate_up_proj.weight = nn.Parameter(fused_weight)
+
+    # Compress fused linear
+    rans_compress_module_weight_bf16(gate_up_proj)
+
+    # Attach to ffn module
+    # NOTE: We keep the name gate_proj for compatibility with vLLM's naming
+    ffn_module.gate_proj = gate_up_proj
+    ffn_module.gate_up_fused = True
+
+    # Remove unfused projections
+    # del ffn_module.gate_proj
+    del ffn_module.up_proj
+
 
 def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> None:
     if not hasattr(module, "weight"):
@@ -165,14 +205,12 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     # Note: Allocating full size is safe but conservative.
     bytes_to_allocate = module.expanded_size
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
-    
+
     # --- EXPONENT COMPRESSION ---
     print("Compressing Exponent...")
     exponent_compression = exp_memory_manager.compress(
-        exponent, # Tensor (uint8)
-        module.exponent_freqs,
-        module.exponent_cdf
-    )   
+        exponent, module.exponent_freqs, module.exponent_cdf  # Tensor (uint8)
+    )
 
     if exponent_compression.success:
         # Direct assignment (Assuming C++ returns a Tensor now)
@@ -183,7 +221,7 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         # We don't strictly need stream_size, we can use len(tensor)
     else:
         # Fallback: Store raw
-        module.exponent_raw = exponent 
+        module.exponent_raw = exponent
         print("Exponent compression failed. Storing raw.")
 
     # --- MANTISSA COMPRESSION ---
@@ -192,7 +230,7 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         print("Compressing Mantissa...")
         mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
         mantissa_compression = mantissa_memory_manager.compress(
-            mantissa, # Tensor (uint8)
+            mantissa,  # Tensor (uint8)
             module.mantissa_freqs,
             module.mantissa_cdf,
         )
@@ -205,12 +243,13 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     else:
         # Fallback: Store raw
         # If skip_mantissa=True, we end up here too.
-        module.mantissa_raw = mantissa 
+        module.mantissa_raw = mantissa
 
     # Cleanup
     module.compressed = "rans_bfloat16"
     del module.weight
     print(f"Compression complete. Original: {module.expanded_size*2} bytes.")
+
 
 def rans_compress_module_weight_int8(module: nn.Module) -> None:
     """
@@ -267,6 +306,7 @@ def rans_compress_module_weight(module: nn.Module) -> None:
             f"Module weight dtype is {module.weight.dtype}, not supported for RANS compression. Skipping."
         )
 
+
 def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if not hasattr(module, "compressed"):
         print("Module is not compressed. Skipping decompression.")
@@ -278,25 +318,25 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if hasattr(module, "exponent_compressed_weight"):
         # Create output buffer
         raw_exponent = ccore.allocate_pinned_tensor(module.expanded_size)
-        
+
         # Instantiate Manager
         manager_exp = ccore.RansManager(len(module.exponent_compressed_weight))
 
         # Decompress
         _ = manager_exp.decompress_into(
-            module.exponent_compressed_weight, # Stream
-            module.exponent_states.to(torch.int32), # Ensure Int32 for C++
+            module.exponent_compressed_weight,  # Stream
+            module.exponent_states.to(torch.int32),  # Ensure Int32 for C++
             module.exponent_output_sizes.to(torch.int32),
             module.exponent_num_streams,
             module.exponent_freqs,
             module.exponent_cdf,
-            raw_exponent # Destination
+            raw_exponent,  # Destination
         )
     else:
         # Fallback: Check for raw attribute
         if hasattr(module, "exponent_raw"):
             raw_exponent = module.exponent_raw.flatten()
-        elif hasattr(module, "exponent"): # Legacy check
+        elif hasattr(module, "exponent"):  # Legacy check
             raw_exponent = module.exponent.flatten()
         else:
             raise RuntimeError(f"Missing exponent data for {module}")
@@ -304,7 +344,7 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if hasattr(module, "mantissa_compressed_weight"):
         # Create output buffer
         raw_mantissa = ccore.allocate_pinned_tensor(module.expanded_size)
-        
+
         # Instantiate Manager
         manager_man = ccore.RansManager(module.mantissa_stream_size)
 
@@ -316,7 +356,7 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
             module.mantissa_num_streams,
             module.mantissa_freqs,
             module.mantissa_cdf,
-            raw_mantissa # Destination
+            raw_mantissa,  # Destination
         )
     else:
         # Fallback
@@ -329,9 +369,7 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
 
     # Reconstruct tensor (Exp Tensor + Mantissa Tensor -> Tensor)
     decompressed_flat = reconstruct_from_exp_and_mantissa(
-        raw_exponent, 
-        raw_mantissa, 
-        dtype=torch.bfloat16
+        raw_exponent, raw_mantissa, dtype=torch.bfloat16
     )
 
     # Determine Shape
@@ -348,6 +386,7 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     module.weight = decompressed_flat.reshape(shape)
 
     print(f"Success: Decompressed. Shape: {module.weight.shape}")
+
 
 def rans_decompress_module_weight_int8(module: nn.Module) -> None:
     """Decompress the module's weight using RANS and restore it to weight."""

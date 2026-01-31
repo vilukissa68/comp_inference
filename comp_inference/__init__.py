@@ -14,6 +14,7 @@ from .comp_inference import (
     get_rans_lut,
     rans_compress_module_weight,
     rans_compress_qkv_fused,
+    rans_compress_gate_up_fused,
     rans_decompress_module_weight,
     extract_exp_and_mantissa,
     reconstruct_from_exp_and_mantissa,
