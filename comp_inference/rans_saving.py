@@ -106,12 +106,15 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
         tensors[
             f"{base_name}{p}rans_exp_sizes"
         ] = module.exponent_output_sizes.cpu().to(torch.int32)
-        tensors[f"{base_name}{p}rans_exp_freqs"] = module.exponent_freqs.cpu().to(
-            torch.uint16
-        )
-        tensors[f"{base_name}{p}rans_exp_cdf"] = module.exponent_cdf.cpu().to(
-            torch.uint16
-        )
+        # tensors[f"{base_name}{p}rans_exp_freqs"] = module.exponent_freqs.cpu().to(
+        #     torch.uint16
+        # )
+        # tensors[f"{base_name}{p}rans_exp_cdf"] = module.exponent_cdf.cpu().to(
+        #     torch.uint16
+        # )
+        tensors[f"{base_name}{p}rans_exp_tables"] = module.exponent_tables.cpu()
+        tensors[f"{base_name}{p}rans_exp_slot_map"] = module.exponent_slot_map.cpu()
+
         exp_streams = module.exponent_num_streams
         is_exp_compressed = 1
     else:
@@ -255,12 +258,15 @@ def _load_rans_layer(module: nn.Module, prefix: str, f):
         module.exponent_compressed_weight = f.get_tensor(f"{prefix}.rans_exp_stream")
         module.exponent_states = f.get_tensor(f"{prefix}.rans_exp_states")
         module.exponent_output_sizes = f.get_tensor(f"{prefix}.rans_exp_sizes")
-        module.exponent_freqs = f.get_tensor(
-            f"{prefix}.rans_exp_freqs"
-        )  # .to(torch.uint16)
-        module.exponent_cdf = f.get_tensor(
-            f"{prefix}.rans_exp_cdf"
-        )  # .to(torch.uint16)
+        # module.exponent_freqs = f.get_tensor(
+        #     f"{prefix}.rans_exp_freqs"
+        # )
+        # module.exponent_cdf = f.get_tensor(
+        #     f"{prefix}.rans_exp_cdf"
+        # )
+
+        module.exponent_tables = f.get_tensor(f"{prefix}.rans_exp_tables")
+        module.exponent_slot_map = f.get_tensor(f"{prefix}.rans_exp_slot_map")
 
         module.exponent_num_streams = exp_num_streams
         module.exponent_stream_size = module.exponent_compressed_weight.numel()

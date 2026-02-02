@@ -37,7 +37,8 @@ struct RansTraits {
     static constexpr int io_mask = (1 << io_bits) - 1;
 
     // Lower bound for renormalization
-    static constexpr int state_l_exp = (io_bits == 8) ? 16 : 24; // 2**16 for byte, 2**24 for word
+    static constexpr int state_l_exp =
+        (io_bits == 8) ? 16 : 24; // 2**16 for byte, 2**24 for word
     static constexpr state_t rans_l = static_cast<state_t>(1) << state_l_exp;
 
     // Use packed CDF and frequency info if possible
@@ -47,7 +48,6 @@ struct RansTraits {
                                   RansSymInfoPacked // False: Use 32-bit struct
                                   >::type;
 };
-
 
 // CDF and Frequency tables for encoding
 template <typename RansConfig> struct RansTablesCore {
@@ -71,10 +71,10 @@ template <typename RansConfig> struct RansEncoderCtx {
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;
     using io_t = typename RansConfig::io_t;
-	using sym_info_t = typename RansConfig::sym_info_t;
+    using sym_info_t = typename RansConfig::sym_info_t;
 
-	// Was compression successful
-	bool success;
+    // Was compression successful
+    bool success;
 
     // Input data
     const symbol_t *__restrict__ symbols;
@@ -98,22 +98,21 @@ template <typename RansConfig> struct RansDecoderCtx {
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;
     using io_t = typename RansConfig::io_t;
-	using sym_info_t = typename RansConfig::sym_info_t;
+    using sym_info_t = typename RansConfig::sym_info_t;
 
-    io_t* __restrict__ input;
-    state_t* __restrict__ initial_states;
+    const io_t *__restrict__ input;
+    const state_t *__restrict__ initial_states;
 
-    uint32_t* __restrict__ input_sizes;
+    const uint32_t *__restrict__ input_sizes;
 
-	symbol_t* __restrict__ output;
-	uint32_t output_size; // This is same for each stream
+    symbol_t *__restrict__ output;
+    const uint32_t output_size;
 
-	// Capacity of each interleaved stream
-	uint32_t stream_capacity;
+    // Capacity of each interleaved stream
+    const uint32_t stream_capacity;
 
-	// Total number of interleaved streams
-	uint32_t num_streams;
+    // Total number of interleaved streams
+    const uint32_t num_streams;
 
-	RansTablesFull<RansConfig> tables;
-
+    const RansTablesFull<RansConfig> tables;
 };

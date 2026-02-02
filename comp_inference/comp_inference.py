@@ -197,9 +197,13 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     # 2. Extract
     exponent, mantissa = extract_exp_and_mantissa(module.weight)
 
+    print("Raw exponent before compression:", exponent)
     # 3. Compute LUTs (Assuming get_rans_lut returns Tensors)
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
     module.mantissa_freqs, module.mantissa_cdf = get_rans_lut(mantissa.to(torch.uint8))
+
+    print("Exponent freqs:", module.exponent_freqs[:10])
+    print("Exponent cdf:", module.exponent_cdf[:10])
 
     # 4. Allocate Managers
     # Note: Allocating full size is safe but conservative.
@@ -209,16 +213,19 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
     # --- EXPONENT COMPRESSION ---
     print("Compressing Exponent...")
     exponent_compression = exp_memory_manager.compress(
-        exponent, module.exponent_freqs, module.exponent_cdf  # Tensor (uint8)
+        exponent,
+        module.exponent_freqs.contiguous(),
+        module.exponent_cdf.contiguous(),  # Tensor (uint8)
     )
+    torch.cuda.current_stream().synchronize()
 
     if exponent_compression.success:
-        # Direct assignment (Assuming C++ returns a Tensor now)
         module.exponent_compressed_weight = exponent_compression.stream
         module.exponent_states = exponent_compression.states
         module.exponent_output_sizes = exponent_compression.output_sizes
         module.exponent_num_streams = exponent_compression.num_streams
-        # We don't strictly need stream_size, we can use len(tensor)
+        module.exponent_tables = exponent_compression.tables
+        module.exponent_slot_map = exponent_compression.slot_map
     else:
         # Fallback: Store raw
         module.exponent_raw = exponent
@@ -240,6 +247,8 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         module.mantissa_states = mantissa_compression.states
         module.mantissa_output_sizes = mantissa_compression.output_sizes
         module.mantissa_num_streams = mantissa_compression.num_streams
+        module.mantissa_tables = mantissa_compression.tables
+        module.mantissa_slot_map = mantissa_compression.slot_map
     else:
         # Fallback: Store raw
         # If skip_mantissa=True, we end up here too.
@@ -317,21 +326,37 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
 
     if hasattr(module, "exponent_compressed_weight"):
         # Create output buffer
-        raw_exponent = ccore.allocate_pinned_tensor(module.expanded_size)
+        # raw_exponent = ccore.allocate_pinned_tensor(module.expanded_size)
 
-        # Instantiate Manager
-        manager_exp = ccore.RansManager(len(module.exponent_compressed_weight))
-
-        # Decompress
-        _ = manager_exp.decompress_into(
-            module.exponent_compressed_weight,  # Stream
-            module.exponent_states.to(torch.int32),  # Ensure Int32 for C++
-            module.exponent_output_sizes.to(torch.int32),
-            module.exponent_num_streams,
-            module.exponent_freqs,
-            module.exponent_cdf,
-            raw_exponent,  # Destination
+        raw_exponent_cuda = torch.empty(
+            module.expanded_size, dtype=torch.uint8, device="cuda"
         )
+        # # Instantiate Manager
+        # manager_exp = ccore.RansManager(len(module.exponent_compressed_weight))
+
+        # # Decompress
+        # _ = manager_exp.decompress_into(
+        #     module.exponent_compressed_weight,  # Stream
+        #     module.exponent_states.to(torch.int32),  # Ensure Int32 for C++
+        #     module.exponent_output_sizes.to(torch.int32),
+        #     module.exponent_num_streams,
+        #     module.exponent_freqs,
+        #     module.exponent_cdf,
+        #     raw_exponent,  # Destination
+        # )
+        ccore.decompress(
+            module.exponent_compressed_weight.to("cuda").contiguous(),
+            module.exponent_states.to(torch.int32).to("cuda").contiguous(),
+            module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
+            module.exponent_num_streams,
+            module.exponent_tables.to("cuda").contiguous(),
+            module.exponent_slot_map.to("cuda").contiguous(),
+            raw_exponent_cuda.contiguous(),
+        )
+
+        raw_exponent = raw_exponent_cuda.cpu().flatten()
+        print("Raw exponent decompressed:", raw_exponent)
+
     else:
         # Fallback: Check for raw attribute
         if hasattr(module, "exponent_raw"):
