@@ -34,7 +34,7 @@ setup(
         'build_ext': BuildExtension
     },
     install_requires=[
-        'torch',
+        'torch==2.9.1',
         'numpy',
         'transformers' # Needed for your high-level tests
     ]
