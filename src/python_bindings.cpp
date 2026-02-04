@@ -135,23 +135,25 @@ PYBIND11_MODULE(ccore, m) {
 
         .def("compress",
              [](RansManager &self, py::array_t<uint8_t> data,
-                py::array_t<uint16_t> freqs,
-                py::array_t<uint16_t> cdf) -> RansManager::CompressResult {
+                py::array_t<uint16_t> freqs, py::array_t<uint16_t> cdf,
+                size_t min_block_size) -> RansManager::CompressResult {
                  std::cout << "Using numpy arrays for compress()" << std::endl;
                  auto d = data.request();
                  auto f = freqs.request();
                  auto c = cdf.request();
                  return self.compress((uint8_t *)d.ptr, d.size,
-                                      (uint16_t *)f.ptr, (uint16_t *)c.ptr);
+                                      (uint16_t *)f.ptr, (uint16_t *)c.ptr,
+                                      min_block_size);
              })
 
         // 3. The Compress Binding
         .def("compress",
              [](RansManager &self, at::Tensor data, at::Tensor freqs,
-                at::Tensor cdf) -> TensorCompressResult {
-                 auto res = self.compress(
-                     data.data_ptr<uint8_t>(), data.numel(),
-                     freqs.data_ptr<uint16_t>(), cdf.data_ptr<uint16_t>());
+                at::Tensor cdf, size_t min_block_size) -> TensorCompressResult {
+                 auto res =
+                     self.compress(data.data_ptr<uint8_t>(), data.numel(),
+                                   freqs.data_ptr<uint16_t>(),
+                                   cdf.data_ptr<uint16_t>(), min_block_size);
 
                  auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8);
                  auto stream_t =

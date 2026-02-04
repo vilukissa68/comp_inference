@@ -31,6 +31,7 @@ def main():
     parser.add_argument(
         "--skip_embedding", action="store_true", help="Skip embedding layer compression"
     )
+    parser.add_argument("--block_size", type=int, default=4096, help="rANS block size")
     args = parser.parse_args()
 
     print("Full Model Round-Trip rANS Compression Test")
@@ -72,7 +73,7 @@ def main():
             and hasattr(module, "v_proj")
         ):
             print(f"Fusing QKV for {name}")
-            rans_compress_qkv_fused(module)
+            rans_compress_qkv_fused(module, block_size=args.block_size)
             continue
 
         # Gate up fusion
@@ -83,7 +84,7 @@ def main():
             and hasattr(module, "up_proj")
         ):
             print(f"Fusing gate and up for {name}")
-            rans_compress_gate_up_fused(module)
+            rans_compress_gate_up_fused(module, block_size=args.block_size)
             continue
 
         # Only target modules with weights
@@ -92,7 +93,7 @@ def main():
             if module.weight.ndim < 2:
                 continue
 
-            rans_compress_module_weight(module)
+            rans_compress_module_weight(module, block_size=args.block_size)
             if not hasattr(module, "compressed"):
                 print(f"Warning: Compression failed for {name}")
     print("Compression phase completed.")

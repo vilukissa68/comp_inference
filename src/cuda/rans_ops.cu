@@ -13,11 +13,11 @@ RansManager::RansManager(size_t max_data_size_hint) {
 
 RansManager::~RansManager() { delete ws; }
 
-RansManager::CompressResult RansManager::compress(const uint8_t *data,
-                                                  size_t size,
-                                                  const uint16_t *freqs,
-                                                  const uint16_t *cdf) {
-    auto config = StreamConfigurator<RansConfig8>::suggest(size);
+RansManager::CompressResult
+RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
+                      const uint16_t *cdf, size_t min_block_size) {
+    auto config =
+        StreamConfigurator<RansConfig8>::suggest(size, min_block_size);
 
     auto gpu_result = rans_compress_cuda<RansConfig8>(ws->internal, data, size,
                                                       freqs, cdf, config);

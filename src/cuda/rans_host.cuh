@@ -23,7 +23,6 @@ struct RansConfig8 : public RansTraits<uint8_t, uint32_t, uint8_t, 12> {
     using sym_info_t = RansSymInfoPacked;
 };
 
-
 template <typename Config> struct RansWorkspace {
     using symbol_t = typename Config::symbol_t;
     using io_t = typename Config::io_t;
@@ -146,7 +145,7 @@ struct KernelConfig {
 };
 
 template <typename Config> struct StreamConfigurator {
-    static KernelConfig suggest(size_t total_data_size) {
+    static KernelConfig suggest(size_t total_data_size, size_t min_chunk_size) {
         int device;
         cudaGetDevice(&device);
         cudaDeviceProp prop;
@@ -155,12 +154,6 @@ template <typename Config> struct StreamConfigurator {
         int min_grid_size, best_block_size;
         cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &best_block_size,
                                            rans_compress_kernel<Config>, 0, 0);
-
-        // CONFIGURATION:
-        // rANS needs a decent chunk size to amortize the state headers.
-        // 4KB is a safe minimum. 32KB is often better for ratio.
-        uint32_t min_chunk_size = CHUNK_SIZE;
-        // uint32_t min_chunk_size = 32768;
 
         // Calculate max streams allowed by data size
         uint32_t calculated_streams =

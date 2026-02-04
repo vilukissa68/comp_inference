@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import os
 from . import ccore
 from typing import Tuple
 
@@ -107,7 +106,7 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def rans_compress_qkv_fused(self_attn_module: nn.Module):
+def rans_compress_qkv_fused(self_attn_module: nn.Module, block_size=4096):
     """
     Fuse q_proj, k_proj, v_proj into a single qkv_proj and
     compress it using rANS.
@@ -134,7 +133,7 @@ def rans_compress_qkv_fused(self_attn_module: nn.Module):
     qkv_proj.weight = nn.Parameter(fused_weight)
 
     # Compress fused linear
-    rans_compress_module_weight_bf16(qkv_proj)
+    rans_compress_module_weight_bf16(qkv_proj, block_size=block_size)
 
     # Attach to attention module
     # NOTE: We keep the name q_proj for compatibility with vLLM's naming
@@ -147,7 +146,7 @@ def rans_compress_qkv_fused(self_attn_module: nn.Module):
     del self_attn_module.v_proj
 
 
-def rans_compress_gate_up_fused(ffn_module: nn.Module):
+def rans_compress_gate_up_fused(ffn_module: nn.Module, block_size=4096):
     """
     Fuse gate_proj and up_proj into a single gate_up_proj and
     compress it using rANS.
@@ -170,7 +169,7 @@ def rans_compress_gate_up_fused(ffn_module: nn.Module):
     gate_up_proj.weight = nn.Parameter(fused_weight)
 
     # Compress fused linear
-    rans_compress_module_weight_bf16(gate_up_proj)
+    rans_compress_module_weight_bf16(gate_up_proj, block_size=block_size)
 
     # Attach to ffn module
     # NOTE: We keep the name gate_proj for compatibility with vLLM's naming
@@ -182,7 +181,9 @@ def rans_compress_gate_up_fused(ffn_module: nn.Module):
     del ffn_module.up_proj
 
 
-def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> None:
+def rans_compress_module_weight_bf16(
+    module: nn.Module, skip_mantissa=True, block_size=4096
+) -> None:
     if not hasattr(module, "weight"):
         return
     if module.weight.dtype != torch.bfloat16:
@@ -216,6 +217,7 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
         exponent,
         module.exponent_freqs.contiguous(),
         module.exponent_cdf.contiguous(),  # Tensor (uint8)
+        block_size,
     )
     torch.cuda.current_stream().synchronize()
 
@@ -240,6 +242,7 @@ def rans_compress_module_weight_bf16(module: nn.Module, skip_mantissa=True) -> N
             mantissa,  # Tensor (uint8)
             module.mantissa_freqs,
             module.mantissa_cdf,
+            block_size,
         )
 
     if mantissa_compression and mantissa_compression.success:
@@ -303,11 +306,11 @@ def rans_compress_module_weight_int8(module: nn.Module) -> None:
     print("Module weight compressed using RANS.")
 
 
-def rans_compress_module_weight(module: nn.Module) -> None:
+def rans_compress_module_weight(module: nn.Module, block_size=4096) -> None:
     if not hasattr(module, "weight"):
         return
     if module.weight.dtype == torch.bfloat16:
-        rans_compress_module_weight_bf16(module)
+        rans_compress_module_weight_bf16(module, block_size=block_size)
     elif module.weight.dtype in [torch.uint8, torch.int8]:
         rans_compress_module_weight_int8(module)
     else:
