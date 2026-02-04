@@ -35,7 +35,7 @@ setup(
     },
     install_requires=[
         'torch==2.9.1',
-        'numpy',
+        'numpy<=2.2',
         'transformers' # Needed for your high-level tests
     ]
 )

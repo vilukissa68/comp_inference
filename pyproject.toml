@@ -6,6 +6,6 @@ requires = [
     "packaging",
     "cmake>=3.18",
 	"torch==2.9.1",
-    "numpy",
+    "numpy<=2.2",
 ]
 build-backend = "setuptools.build_meta"
