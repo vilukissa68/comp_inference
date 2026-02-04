@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <type_traits>
 
+#define CHUNK_SIZE 4096
+
 // Pack symbol info for faster access during decoding
 // NOTE: This is safe for PROB_SCALE <= 2**15
 struct __align__(4) RansSymInfoPacked {
