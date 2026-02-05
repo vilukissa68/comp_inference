@@ -24,6 +24,21 @@ struct TensorCompressResult {
     size_t stream_len;
 };
 
+struct TiledTensorCompressResult {
+    bool success;
+    torch::Tensor stream;
+    torch::Tensor states;
+    torch::Tensor tables;
+    torch::Tensor slot_map;
+    torch::Tensor output_sizes;
+    uint32_t num_streams;
+    size_t stream_len;
+    torch::Tensor tile_offsets;
+    torch::Tensor tile_max_lens;
+    uint32_t num_tiles_n;
+    uint32_t num_tiles_k;
+};
+
 PYBIND11_MODULE(ccore, m) {
     m.doc() = "Python bindings for CUDA accelerated operations";
     m.def(
@@ -114,6 +129,22 @@ PYBIND11_MODULE(ccore, m) {
         .def_readonly("stream_len", &TensorCompressResult::stream_len)
         .def_readonly("checkpoints", &TensorCompressResult::checkpoints);
 
+    // 1. Register the Tiled Tensor Result for Python/PyTorch
+    py::class_<TiledTensorCompressResult>(m, "TiledTensorCompressResult")
+        .def_readonly("success", &TiledTensorCompressResult::success)
+        .def_readonly("stream", &TiledTensorCompressResult::stream)
+        .def_readonly("states", &TiledTensorCompressResult::states)
+        .def_readonly("tables", &TiledTensorCompressResult::tables)
+        .def_readonly("slot_map", &TiledTensorCompressResult::slot_map)
+        .def_readonly("output_sizes", &TiledTensorCompressResult::output_sizes)
+        .def_readonly("num_streams", &TiledTensorCompressResult::num_streams)
+        .def_readonly("stream_len", &TiledTensorCompressResult::stream_len)
+        .def_readonly("tile_offsets", &TiledTensorCompressResult::tile_offsets)
+        .def_readonly("tile_max_lens",
+                      &TiledTensorCompressResult::tile_max_lens)
+        .def_readonly("num_tiles_n", &TiledTensorCompressResult::num_tiles_n)
+        .def_readonly("num_tiles_k", &TiledTensorCompressResult::num_tiles_k);
+
     py::class_<RansManager::CompressResult>(m, "CompressResult")
         .def_readonly("success", &RansManager::CompressResult::success)
         .def_property_readonly("stream",
@@ -152,22 +183,31 @@ PYBIND11_MODULE(ccore, m) {
                 py::array_t<uint16_t> freqs, py::array_t<uint16_t> cdf,
                 size_t min_block_size) -> RansManager::CompressResult {
                  std::cout << "Using numpy arrays for compress()" << std::endl;
+                 const ssize_t *shape_ptr = data.shape();
+                 size_t rank = data.ndim();
+
+                 const std::pair<size_t, size_t> shape = {
+                     static_cast<size_t>(shape_ptr[0]),
+                     (rank > 1) ? static_cast<size_t>(shape_ptr[1]) : 1};
                  auto d = data.request();
                  auto f = freqs.request();
                  auto c = cdf.request();
                  return self.compress((uint8_t *)d.ptr, d.size,
                                       (uint16_t *)f.ptr, (uint16_t *)c.ptr,
-                                      min_block_size);
+                                      shape, min_block_size);
              })
 
         // 3. The Compress Binding
         .def("compress",
              [](RansManager &self, at::Tensor data, at::Tensor freqs,
                 at::Tensor cdf, size_t min_block_size) -> TensorCompressResult {
-                 auto res =
-                     self.compress(data.data_ptr<uint8_t>(), data.numel(),
-                                   freqs.data_ptr<uint16_t>(),
-                                   cdf.data_ptr<uint16_t>(), min_block_size);
+                 auto shape_vec = data.sizes().vec();
+                 const std::pair<size_t, size_t> shape = {
+                     shape_vec[0], shape_vec.size() > 1 ? shape_vec[1] : 1};
+                 auto res = self.compress(
+                     data.data_ptr<uint8_t>(), data.numel(),
+                     freqs.data_ptr<uint16_t>(), cdf.data_ptr<uint16_t>(),
+                     shape, min_block_size);
 
                  auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8);
                  auto stream_t =
@@ -212,6 +252,52 @@ PYBIND11_MODULE(ccore, m) {
                      res.success,   stream_t,        states_t,
                      sizes_t,       tables_t,        slot_map_t,
                      checkpoints_t, res.num_streams, res.stream_len};
+             })
+
+        // Tiled Compression for PyTorch Tensors
+        .def("compress_tiled",
+             [](RansManager &self, at::Tensor data, at::Tensor freqs,
+                at::Tensor cdf, uint32_t tile_height,
+                uint32_t tile_width) -> TiledTensorCompressResult {
+                 auto shape_vec = data.sizes().vec();
+                 const std::pair<size_t, size_t> shape = {
+                     static_cast<size_t>(shape_vec[0]),
+                     shape_vec.size() > 1 ? static_cast<size_t>(shape_vec[1])
+                                          : 1};
+
+                 // Call the C++ manager (The code we refined earlier)
+                 auto res = self.compress_tiled(
+                     data.data_ptr<uint8_t>(), data.numel(),
+                     freqs.data_ptr<uint16_t>(), cdf.data_ptr<uint16_t>(),
+                     shape, tile_height, tile_width);
+
+                 // Helper to convert std::vector to cloned Torch Tensors
+                 auto to_tensor_u8 = [](const std::vector<uint8_t> &vec) {
+                     return torch::from_blob((void *)vec.data(),
+                                             {static_cast<long>(vec.size())},
+                                             torch::kUInt8)
+                         .clone();
+                 };
+                 auto to_tensor_u32 = [](const std::vector<uint32_t> &vec) {
+                     return torch::from_blob((void *)vec.data(),
+                                             {static_cast<long>(vec.size())},
+                                             torch::kUInt32)
+                         .clone();
+                 };
+
+                 return TiledTensorCompressResult{
+                     res.success,
+                     to_tensor_u8(res.stream),
+                     to_tensor_u32(res.states),
+                     to_tensor_u32(res.tables),
+                     to_tensor_u8(res.slot_map),
+                     to_tensor_u32(res.sizes),
+                     res.num_streams,
+                     res.stream_len,
+                     to_tensor_u32(res.tile_offsets),
+                     to_tensor_u32(res.tile_max_lens),
+                     res.num_tiles_n,
+                     res.num_tiles_k};
              })
 
         .def("decompress",

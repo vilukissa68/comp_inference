@@ -31,7 +31,11 @@ def main():
     parser.add_argument(
         "--skip_embedding", action="store_true", help="Skip embedding layer compression"
     )
-    parser.add_argument("--block_size", type=int, default=4096, help="rANS block size")
+    parser.add_argument(
+        "--tile_height", type=int, default=1024, help="rANS tile height"
+    )
+    parser.add_argument("--tile_width", type=int, default=32, help="rANS tile width")
+
     args = parser.parse_args()
 
     print("Full Model Round-Trip rANS Compression Test")
@@ -58,10 +62,14 @@ def main():
 
     compressed_count = 0
     total_params = 0
+    layers_compressed = 0
 
     for name, module in model.named_modules():
+        print("-" * 80)
         print(f"Processing module: {name} ({type(module)})")
-        if name == "model.embed_tokens" and args.skip_embedding:
+        if (
+            name == "model.embed_tokens" or name == "model.lm_head" or name == "lm_head"
+        ) and args.skip_embedding:
             print("Skipping compressing embedding layer.")
             continue
 
@@ -73,7 +81,10 @@ def main():
             and hasattr(module, "v_proj")
         ):
             print(f"Fusing QKV for {name}")
-            rans_compress_qkv_fused(module, block_size=args.block_size)
+            rans_compress_qkv_fused(
+                module, tile_height=args.tile_height, tile_width=args.tile_width
+            )
+            layers_compressed += 1
             continue
 
         # Gate up fusion
@@ -84,7 +95,10 @@ def main():
             and hasattr(module, "up_proj")
         ):
             print(f"Fusing gate and up for {name}")
-            rans_compress_gate_up_fused(module, block_size=args.block_size)
+            rans_compress_gate_up_fused(
+                module, tile_height=args.tile_height, tile_width=args.tile_width
+            )
+            layers_compressed += 1
             continue
 
         # Only target modules with weights
@@ -93,7 +107,10 @@ def main():
             if module.weight.ndim < 2:
                 continue
 
-            rans_compress_module_weight(module, block_size=args.block_size)
+            rans_compress_module_weight(
+                module, tile_height=args.tile_height, tile_width=args.tile_width
+            )
+            layers_compressed += 1
             if not hasattr(module, "compressed"):
                 print(f"Warning: Compression failed for {name}")
     print("Compression phase completed.")

@@ -22,8 +22,33 @@ def save_rans_model_package(
     if not hasattr(model.config, "quantization_config"):
         model.config.quantization_config = {}
 
+    layer_configs = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
+            # Extract the specific tile dimensions for this tensor
+            th = getattr(
+                module, "exponent_tile_height", getattr(module, "tile_height", 1024)
+            )
+            tw = getattr(
+                module, "exponent_tile_width", getattr(module, "tile_width", 32)
+            )
+
+            print("Before:", name)
+            if "gate_proj" in name:
+                name = name.replace("gate_proj", "gate_up_proj")
+            elif "q_proj" in name:
+                name = name.replace("q_proj", "qkv_proj")
+            print("After:", name)
+
+            # Name will be exactly as it appears in the model structure
+            layer_configs[name] = {"tile_height": th, "tile_width": tw}
+
+    # Inject the dictionary into the quantization config
     model.config.quantization_config["quant_method"] = "rans"
     model.config.quantization_config["compression"] = "rans_bfloat16"
+    model.config.quantization_config["layer_configs"] = layer_configs
+    model.config.quantization_config["default_tile_height"] = 1024
+    model.config.quantization_config["default_tile_width"] = 32
 
     # 2. Save Config & Tokenizer
     print(f"Saving config and tokenizer to {output_dir}...")
@@ -91,36 +116,78 @@ def pack_and_save_tensors(model, output_path: str):
     print(f"Saved {len(tensors)} tensors.")
 
 
-# (Ensure _save_rans_attributes is defined as in the previous answer)
 def _save_rans_attributes(tensors, base_name, prefix, module):
     p = prefix
 
-    # Exponent
-    if hasattr(module, "exponent_compressed_weight"):
-        tensors[
-            f"{base_name}{p}rans_exp_stream"
-        ] = module.exponent_compressed_weight.cpu()
-        tensors[f"{base_name}{p}rans_exp_states"] = module.exponent_states.cpu().to(
-            torch.int32
-        )
-        tensors[
-            f"{base_name}{p}rans_exp_sizes"
-        ] = module.exponent_output_sizes.cpu().to(torch.int32)
-        # tensors[f"{base_name}{p}rans_exp_freqs"] = module.exponent_freqs.cpu().to(
-        #     torch.uint16
-        # )
-        # tensors[f"{base_name}{p}rans_exp_cdf"] = module.exponent_cdf.cpu().to(
-        #     torch.uint16
-        # )
-        tensors[f"{base_name}{p}rans_exp_tables"] = module.exponent_tables.cpu()
-        tensors[f"{base_name}{p}rans_exp_slot_map"] = module.exponent_slot_map.cpu()
+    num_tiles_n = 0
+    num_tiles_k = 0
+    tile_height = 0
+    tile_width = 0
 
-        exp_streams = module.exponent_num_streams
+    # Helper to force dtypes and avoid signed-bit corruption
+    def _to_u32(t):
+        return t.cpu().to(torch.uint32)
+
+    def _to_u8(t):
+        return t.cpu().to(torch.uint8)
+
+    def _validate_and_get(module, attr_name, expected_dtype):
+        if not hasattr(module, attr_name):
+            return None
+
+        tensor = getattr(module, attr_name)
+
+        # Check if the tensor matches the requirement
+        if tensor.dtype != expected_dtype:
+            # We log a warning and cast, but in a 'strict' mode you might raise RuntimeError
+            print(
+                f"WARNING: {attr_name} has dtype {tensor.dtype}, forcing to {expected_dtype}"
+            )
+            tensor = tensor.to(expected_dtype)
+
+        return tensor.cpu()
+
+    # 1. EXPONENT COMPRESSION DATA
+    if hasattr(module, "exponent_compressed_weight"):
+        num_tiles_n = getattr(module, "exponent_num_tiles_n", 0)
+        num_tiles_k = getattr(module, "exponent_num_tiles_k", 0)
+        tile_height = getattr(module, "exponent_tile_height", 0)
+        tile_width = getattr(module, "exponent_tile_width", 0)
+        exp_streams = getattr(module, "exponent_num_streams", 0)
+
+        # The raw bitstream must be uint8
+        tensors[f"{base_name}{p}rans_exp_stream"] = _validate_and_get(
+            module, "exponent_compressed_weight", torch.uint8
+        )
+
+        # CRITICAL: States must be uint32 to prevent arithmetic shift corruption in Triton
+        tensors[f"{base_name}{p}rans_exp_states"] = _validate_and_get(
+            module, "exponent_states", torch.uint32
+        )
+
+        # Metadata / Tile Metrics
+        tensors[f"{base_name}{p}rans_exp_tile_offsets"] = _validate_and_get(
+            module, "exponent_tile_offsets", torch.uint32
+        )
+
+        tensors[f"{base_name}{p}rans_exp_tile_max_lens"] = _validate_and_get(
+            module, "exponent_tile_max_lens", torch.uint32
+        )
+
+        # Decompression Tables
+        tensors[f"{base_name}{p}rans_exp_tables"] = _validate_and_get(
+            module, "exponent_tables", torch.uint32
+        )
+
+        tensors[f"{base_name}{p}rans_exp_slot_map"] = _validate_and_get(
+            module, "exponent_slot_map", torch.uint8
+        )
         is_exp_compressed = 1
     else:
+        # Fallback for uncompressed raw exponents
         tensors[f"{base_name}{p}rans_exp_raw"] = module.exponent_raw.cpu()
-        exp_streams = 0
         is_exp_compressed = 0
+        exp_streams = 0
 
     # Mantissa
     if hasattr(module, "mantissa_compressed_weight"):
@@ -128,11 +195,11 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
             f"{base_name}{p}rans_man_stream"
         ] = module.mantissa_compressed_weight.cpu()
         tensors[f"{base_name}{p}rans_man_states"] = module.mantissa_states.cpu().to(
-            torch.int32
+            torch.uint32
         )
         tensors[
             f"{base_name}{p}rans_man_sizes"
-        ] = module.mantissa_output_sizes.cpu().to(torch.int32)
+        ] = module.mantissa_output_sizes.cpu().to(torch.uint32)
         tensors[f"{base_name}{p}rans_man_freqs"] = module.mantissa_freqs.cpu().to(
             torch.uint16
         )
@@ -142,9 +209,9 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
         man_streams = module.mantissa_num_streams
         is_man_compressed = 1
     else:
-        tensors[f"{base_name}{p}rans_man_raw"] = module.mantissa_raw.cpu().flatten()
-        man_streams = 0
+        tensors[f"{base_name}{p}rans_man_raw"] = _to_u8(module.mantissa_raw)
         is_man_compressed = 0
+        man_streams = 0
 
     # Info
     shape = getattr(module, "input_shape", [])
@@ -159,6 +226,10 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
         is_man_compressed,
         man_streams,
         len(shape),
+        num_tiles_n,
+        num_tiles_k,
+        tile_height,
+        tile_width,
     ] + list(shape)
 
     tensors[f"{base_name}{p}rans_info"] = torch.tensor(info_data, dtype=torch.int32)
@@ -244,14 +315,20 @@ def _load_rans_layer(module: nn.Module, prefix: str, f):
     is_man_compressed = info[4].item()
     man_num_streams = info[5].item()
     shape_rank = info[6].item()
+    num_tiles_n = info[7].item() if len(info) > 7 else 0
+    num_tiles_k = info[8].item() if len(info) > 8 else 0
+    tile_height = info[9].item() if len(info) > 9 else 0
+    tile_width = info[10].item() if len(info) > 10 else 0
 
     # Reconstruct shape tuple
-    input_shape = torch.Size(info[7 : 7 + shape_rank].tolist())
+    input_shape = torch.Size(info[11 : 11 + shape_rank].tolist())
 
     # Set Module Attributes
     module.compressed = "rans_bfloat16"
     module.expanded_size = expanded_size
     module.input_shape = input_shape
+    module.tile_height = tile_height
+    module.tile_width = tile_width
 
     # 2. Load Exponent Data
     if is_exp_compressed > 0:
@@ -274,6 +351,27 @@ def _load_rans_layer(module: nn.Module, prefix: str, f):
         # Calculate total stream size for the buffer view logic
         # (This is usually just numel, but explicit check helps)
         module.exponent_total_stream_size = module.exponent_stream_size
+
+        if num_tiles_n > 0 and num_tiles_k > 0:
+            module.exponent_num_tiles_n = num_tiles_n
+            module.exponent_num_tiles_k = num_tiles_k
+
+        if (
+            hasattr(module, "exponent_tile_offsets")
+            and f"{prefix}.rans_exp_tile_offsets" in f.keys()
+        ):
+            module.exponent_tile_offsets = f.get_tensor(
+                f"{prefix}.rans_exp_tile_offsets"
+            )
+
+        if (
+            hasattr(module, "exponent_tile_max_lens")
+            and f"{prefix}.rans_exp_tile_max_lens" in f.keys()
+        ):
+            module.exponent_tile_max_lens = f.get_tensor(
+                f"{prefix}.rans_exp_tile_max_lens"
+            )
+
     else:
         # Fallback raw
         if f"{prefix}.rans_exp_raw" in f.keys():

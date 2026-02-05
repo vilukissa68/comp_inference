@@ -96,11 +96,56 @@ template <typename RansConfig> struct RansEncoderCtx {
     // Capacity of each interleaved stream
     uint32_t stream_capacity;
 
+    // Stride between values in a stream, should match width of the tensor for
+    // coalesced access in decoder
+    uint32_t input_height;
+    uint32_t input_width;
+
     // Total number of interleaved streams
     uint32_t num_streams;
 
     RansTablesCore<RansConfig> tables;
     RansCheckpoint *checkpoints;
+};
+
+template <typename RansConfig> struct RansTiledEncoderCtx {
+    using symbol_t = typename RansConfig::symbol_t;
+    using state_t = typename RansConfig::state_t;
+    using io_t = typename RansConfig::io_t;
+    using sym_info_t = typename RansConfig::sym_info_t;
+
+    // --- Control & Status ---
+    bool success;
+    uint32_t tile_height;
+    uint32_t tile_width; // Expected 32 (Warp Width)
+    uint32_t num_tiles_k;
+    uint32_t num_tiles_n;
+
+    // --- Input (Weights) ---
+    const symbol_t *__restrict__ symbols;
+    uint32_t total_height; // K
+    uint32_t total_width;  // N
+
+    // --- Output (The Compressed Texture) ---
+    // 1. The bitstream buffer where ALL tiles are packed
+    io_t *__restrict__ output;
+
+    // 2. Tile-specific starting info
+    // Size: [NumTilesN, NumTilesK, TILE_N]
+    // Indexed by: (tile_id * TILE_N) + local_col
+    state_t *__restrict__ final_states;
+    uint32_t *__restrict__ stream_sizes;
+    uint32_t *__restrict__ values_encoded;
+
+    // 3. The Map: Where each tile starts in output_bytes
+    // Size: [NumTilesN, NumTilesK]
+    // Note: We pass this to the Write Pass, calculated from the Analyze Pass
+    // uint32_t *__restrict__ tile_offsets;
+    uint32_t num_streams;
+    uint32_t stream_capacity;
+
+    // --- Table Info ---
+    RansTablesCore<RansConfig> tables;
 };
 
 template <typename RansConfig> struct RansDecoderCtx {

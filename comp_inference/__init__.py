@@ -18,6 +18,8 @@ from .comp_inference import (
     rans_decompress_module_weight,
     extract_exp_and_mantissa,
     reconstruct_from_exp_and_mantissa,
+    interleave_mantissas,
+    uninterleave_mantissas,
 )
 
 from .rans_saving import (
@@ -28,3 +30,9 @@ from .rans_saving import (
 )
 
 from .rans_gguf import save_rans_model_gguf
+
+from .rans_triton import (
+    fused_rans_linear_triton,
+    rans_decomp_triton,
+    rans_decomp_triton_tiled,
+)

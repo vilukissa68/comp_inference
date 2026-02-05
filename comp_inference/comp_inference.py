@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
+
+from comp_inference.rans_triton import rans_decomp_triton, rans_decomp_triton_tiled
 from . import ccore
 from typing import Tuple
 
@@ -28,6 +30,56 @@ def extract_exp_and_mantissa(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.
     exponent = exponent  # - bias
     mantissa = (sign << mantissa_bits) | mantissa
     return exponent.to(torch.uint8), (mantissa).to(torch.uint8)
+
+
+def interleave_mantissas(mantissas: torch.Tensor, TILE_K=1024, TILE_N=32):
+    """
+    Rearranges mantissas from [K, N] to match the tiled layout.
+    Original: [K, N]
+    Tiled: [NumTilesK, NumTilesN, TILE_K, TILE_N] -> then flattened for the kernel
+    """
+
+    # Ensure mantissa is contiguous
+    assert (
+        mantissas.is_contiguous()
+    ), "Mantissas tensor must be contiguous for interleaving."
+    print("mantissa stride before interleave:", mantissas.stride())
+
+    K, N = mantissas.shape
+    num_tiles_k = (K + TILE_K - 1) // TILE_K
+    num_tiles_n = (N + TILE_N - 1) // TILE_N
+
+    # Pad to tile boundaries
+    pad_k = num_tiles_k * TILE_K - K
+    pad_n = num_tiles_n * TILE_N - N
+    if pad_k > 0 or pad_n > 0:
+        mantissas = torch.nn.functional.pad(mantissas, (0, pad_n, 0, pad_k))
+
+    # Reshape into tiles
+    # [num_tiles_k, TILE_K, num_tiles_n, TILE_N]
+    tiled = mantissas.view(num_tiles_k, TILE_K, num_tiles_n, TILE_N)
+    # Permute to [num_tiles_k, num_tiles_n, TILE_K, TILE_N]
+    tiled = tiled.permute(0, 2, 1, 3).contiguous()
+
+    return tiled.view(-1)  # Flatten for easy indexing in Triton
+
+
+def uninterleave_mantissas(interleaved_mantissas, K, N, TILE_K=1024, TILE_N=32):
+    """
+    Reverses the tiled interleaving to restore a standard [K, N] layout.
+    """
+    num_tiles_k = (K + TILE_K - 1) // TILE_K
+    num_tiles_n = (N + TILE_N - 1) // TILE_N
+
+    # Reshape back to the tiled structure
+    tiled = interleaved_mantissas.view(num_tiles_k, num_tiles_n, TILE_K, TILE_N)
+
+    # Permute back to [num_tiles_k, TILE_K, num_tiles_n, TILE_N]
+    # This matches the logical row/column order
+    restored = tiled.permute(0, 2, 1, 3).contiguous()
+
+    # Flatten to [K_padded, N_padded] and crop to actual K, N
+    return restored.view(num_tiles_k * TILE_K, num_tiles_n * TILE_N)[:K, :N]
 
 
 @torch.compile(dynamic=True)  # Use torch.compile to fuse this into one kernel!
@@ -106,7 +158,9 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def rans_compress_qkv_fused(self_attn_module: nn.Module, block_size=4096):
+def rans_compress_qkv_fused(
+    self_attn_module: nn.Module, tile_height=1024, tile_width=32
+):
     """
     Fuse q_proj, k_proj, v_proj into a single qkv_proj and
     compress it using rANS.
@@ -120,7 +174,7 @@ def rans_compress_qkv_fused(self_attn_module: nn.Module, block_size=4096):
     assert q.shape[1] == k.shape[1] == v.shape[1]
 
     # Fuse QKV for vLLM
-    fused_weight = torch.cat([q, k, v], dim=0)
+    fused_weight = torch.cat([q, k, v], dim=0).contiguous()
 
     # Fake linear for reuse
     qkv_proj = nn.Linear(
@@ -133,7 +187,12 @@ def rans_compress_qkv_fused(self_attn_module: nn.Module, block_size=4096):
     qkv_proj.weight = nn.Parameter(fused_weight)
 
     # Compress fused linear
-    rans_compress_module_weight_bf16(qkv_proj, block_size=block_size)
+    print(
+        f"Compressing fused QKV with shape {fused_weight.shape} and dtype {fused_weight.dtype}"
+    )
+    rans_compress_module_weight_bf16(
+        qkv_proj, tile_height=tile_height, tile_width=tile_width
+    )
 
     # Attach to attention module
     # NOTE: We keep the name q_proj for compatibility with vLLM's naming
@@ -146,7 +205,7 @@ def rans_compress_qkv_fused(self_attn_module: nn.Module, block_size=4096):
     del self_attn_module.v_proj
 
 
-def rans_compress_gate_up_fused(ffn_module: nn.Module, block_size=4096):
+def rans_compress_gate_up_fused(ffn_module: nn.Module, tile_height=1024, tile_width=32):
     """
     Fuse gate_proj and up_proj into a single gate_up_proj and
     compress it using rANS.
@@ -156,7 +215,7 @@ def rans_compress_gate_up_fused(ffn_module: nn.Module, block_size=4096):
     assert gate.dtype == up.dtype == torch.bfloat16
 
     # Fuse Gate and Up
-    fused_weight = torch.cat([gate, up], dim=0)
+    fused_weight = torch.cat([gate, up], dim=0).contiguous()
 
     # Fake linear for reuse
     gate_up_proj = nn.Linear(
@@ -166,10 +225,16 @@ def rans_compress_gate_up_fused(ffn_module: nn.Module, block_size=4096):
         device=fused_weight.device,
         dtype=fused_weight.dtype,
     )
+
     gate_up_proj.weight = nn.Parameter(fused_weight)
 
     # Compress fused linear
-    rans_compress_module_weight_bf16(gate_up_proj, block_size=block_size)
+    print(
+        f"Compressing fused Gate+Up with shape {fused_weight.shape} and dtype {fused_weight.dtype}"
+    )
+    rans_compress_module_weight_bf16(
+        gate_up_proj, tile_height=tile_height, tile_width=tile_width
+    )
 
     # Attach to ffn module
     # NOTE: We keep the name gate_proj for compatibility with vLLM's naming
@@ -182,7 +247,11 @@ def rans_compress_gate_up_fused(ffn_module: nn.Module, block_size=4096):
 
 
 def rans_compress_module_weight_bf16(
-    module: nn.Module, skip_mantissa=True, block_size=4096
+    module: nn.Module,
+    skip_mantissa=True,
+    tile_height=1024,
+    tile_width=32,
+    transpose_weight=True,
 ) -> None:
     if not hasattr(module, "weight"):
         return
@@ -190,34 +259,53 @@ def rans_compress_module_weight_bf16(
         print(f"Skipping {module.weight.dtype}, expected bfloat16.")
         return
 
+    # Transpose weight to [K, N] for consistency with your API
+    if transpose_weight:
+        module.weight = nn.Parameter(module.weight.t().contiguous())
+
+    # # --- DUMP AND DIE (Compression Side) ---
+    # print(f"\n[DUMP] Capturing ground truth weight. Shape: {module.weight.shape}")
+
+    # # Save the physical bytes exactly as the compressor will see them
+    # torch.save(
+    #     {
+    #         "weight_kn": module.weight.detach().cpu(),
+    #         "shape": module.weight.shape,
+    #     },
+    #     "compression_truth.pt",
+    # )
+
+    # print("Ground truth saved to compression_truth.pt. Exiting.")
+    # exit(0)
+
+    print("Weight to compress:", module.weight)
+
     # 1. Save original metadata needed for reconstruction
     # We save this BEFORE deleting the weight
+    print(
+        f"Compressing weight with shape {module.weight.shape} and dtype {module.weight.dtype}"
+    )
     module.input_shape = list(module.weight.shape)
     module.expanded_size = module.weight.numel()
 
     # 2. Extract
-    exponent, mantissa = extract_exp_and_mantissa(module.weight)
+    exponent, mantissa = extract_exp_and_mantissa(module.weight.contiguous())
 
-    print("Raw exponent before compression:", exponent)
     # 3. Compute LUTs (Assuming get_rans_lut returns Tensors)
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
     module.mantissa_freqs, module.mantissa_cdf = get_rans_lut(mantissa.to(torch.uint8))
 
-    print("Exponent freqs:", module.exponent_freqs[:10])
-    print("Exponent cdf:", module.exponent_cdf[:10])
-
-    # 4. Allocate Managers
-    # Note: Allocating full size is safe but conservative.
+    # Allocate work memory
     bytes_to_allocate = module.expanded_size
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
 
     # --- EXPONENT COMPRESSION ---
-    print("Compressing Exponent...")
-    exponent_compression = exp_memory_manager.compress(
+    exponent_compression = exp_memory_manager.compress_tiled(
         exponent,
         module.exponent_freqs.contiguous(),
         module.exponent_cdf.contiguous(),  # Tensor (uint8)
-        block_size,
+        tile_height,
+        tile_width,
     )
     torch.cuda.current_stream().synchronize()
 
@@ -228,6 +316,13 @@ def rans_compress_module_weight_bf16(
         module.exponent_num_streams = exponent_compression.num_streams
         module.exponent_tables = exponent_compression.tables
         module.exponent_slot_map = exponent_compression.slot_map
+        module.exponent_tile_offsets = exponent_compression.tile_offsets
+        module.exponent_tile_max_lens = exponent_compression.tile_max_lens
+        module.exponent_num_tiles_n = exponent_compression.num_tiles_n
+        module.exponent_num_tiles_k = exponent_compression.num_tiles_k
+        module.exponent_tile_height = tile_height
+        module.exponent_tile_width = tile_width
+
     else:
         # Fallback: Store raw
         module.exponent_raw = exponent
@@ -236,7 +331,6 @@ def rans_compress_module_weight_bf16(
     # --- MANTISSA COMPRESSION ---
     mantissa_compression = None
     if not skip_mantissa:
-        print("Compressing Mantissa...")
         mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
         mantissa_compression = mantissa_memory_manager.compress(
             mantissa,  # Tensor (uint8)
@@ -255,12 +349,56 @@ def rans_compress_module_weight_bf16(
     else:
         # Fallback: Store raw
         # If skip_mantissa=True, we end up here too.
-        module.mantissa_raw = mantissa
+        # module.mantissa_raw = mantissa
+
+        # Store mantissa in the interleaved format for potential future use in tiled decompression, even if compression failed or skipped
+        # N, K = mantissa.shape
+        K, N = module.weight.shape
+        mantissa = mantissa.contiguous()
+        print("Mantissa shape before interleaving:", mantissa.shape)
+        print("K={}, N={}".format(K, N))
+        mantissa_interleaved = interleave_mantissas(
+            mantissa, TILE_K=tile_height, TILE_N=tile_width
+        )
+        mantissa_interleaved_copy = (
+            mantissa_interleaved.clone()
+        )  # Keep a copy for verification
+        mantissa_uninterleaved = uninterleave_mantissas(
+            mantissa_interleaved_copy, K, N, TILE_K=tile_height, TILE_N=tile_width
+        )
+
+        if not torch.equal(mantissa, mantissa_uninterleaved):
+            print(
+                "Warning: Interleaving and uninterleaving mantissa did not perfectly restore original. There may be an issue with the interleaving logic."
+            )
+
+        # Check that interleaved mantissa is actually different from original mantissa
+        assert not torch.equal(
+            mantissa, mantissa_interleaved
+        ), "Interleaved mantissa is the same as original, which should not happen."
+
+        module.mantissa_raw = mantissa_interleaved.contiguous()
+        # module.mantissa_raw = mantissa
 
     # Cleanup
     module.compressed = "rans_bfloat16"
     del module.weight
-    print(f"Compression complete. Original: {module.expanded_size*2} bytes.")
+    original_size = module.expanded_size * 2  # BF16 is 2 bytes per element
+    new_size = 0
+    if mantissa_compression and mantissa_compression.success:
+        new_size += len(mantissa_compression.stream)
+    else:
+        new_size += mantissa.numel()
+    if exponent_compression and exponent_compression.success:
+        new_size += len(exponent_compression.stream)
+    else:
+        new_size += exponent.numel()
+    compression_ratio = original_size / new_size if new_size > 0 else float("inf")
+    print(
+        "Compression complete. Original size: {} bytes, New size: {} bytes, Compression Ratio: {:.2f}x".format(
+            original_size, new_size, compression_ratio
+        )
+    )
 
 
 def rans_compress_module_weight_int8(module: nn.Module) -> None:
@@ -306,11 +444,18 @@ def rans_compress_module_weight_int8(module: nn.Module) -> None:
     print("Module weight compressed using RANS.")
 
 
-def rans_compress_module_weight(module: nn.Module, block_size=4096) -> None:
+def rans_compress_module_weight(
+    module: nn.Module, tile_height=1024, tile_width=32, transpose_weight=True
+) -> None:
     if not hasattr(module, "weight"):
         return
     if module.weight.dtype == torch.bfloat16:
-        rans_compress_module_weight_bf16(module, block_size=block_size)
+        rans_compress_module_weight_bf16(
+            module,
+            tile_height=tile_height,
+            tile_width=tile_width,
+            transpose_weight=transpose_weight,
+        )
     elif module.weight.dtype in [torch.uint8, torch.int8]:
         rans_compress_module_weight_int8(module)
     else:
@@ -326,6 +471,16 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     if module.compressed != "rans_bfloat16":
         print(f"Skipping {module.compressed}, expected rans_bfloat16.")
         return
+
+    # Determine Shape
+    if hasattr(module, "input_shape"):
+        shape = module.input_shape
+    elif hasattr(module, "exponent_shape"):
+        shape = module.exponent_shape
+    else:
+        # Dangerous fallback, but prevents crash if shape lost
+        shape = (module.expanded_size,)
+        print(f"Warning: No shape found for {module}, keeping flat.")
 
     if hasattr(module, "exponent_compressed_weight"):
         # Create output buffer
@@ -347,17 +502,43 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         #     module.exponent_cdf,
         #     raw_exponent,  # Destination
         # )
-        ccore.decompress(
-            module.exponent_compressed_weight.to("cuda").contiguous(),
-            module.exponent_states.to(torch.int32).to("cuda").contiguous(),
-            module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
-            module.exponent_num_streams,
-            module.exponent_tables.to("cuda").contiguous(),
-            module.exponent_slot_map.to("cuda").contiguous(),
-            raw_exponent_cuda.contiguous(),
-        )
+        # ccore.decompress(
+        #     module.exponent_compressed_weight.to("cuda").contiguous(),
+        #     module.exponent_states.to(torch.int32).to("cuda").contiguous(),
+        #     module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
+        #     module.exponent_num_streams,
+        #     module.exponent_tables.to("cuda").contiguous(),
+        #     module.exponent_slot_map.to("cuda").contiguous(),
+        #     raw_exponent_cuda.contiguous(),
+        # )
 
-        raw_exponent = raw_exponent_cuda.cpu().flatten()
+        # raw_exponent = (
+        #     rans_decomp_triton(
+        #         module.exponent_compressed_weight.to("cuda").contiguous(),
+        #         module.exponent_states.to(torch.int32).to("cuda").contiguous(),
+        #         module.exponent_tables.to("cuda").contiguous(),
+        #         module.exponent_slot_map.to("cuda").contiguous(),
+        #         module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
+        #         shape,
+        #     )
+        #     .flatten()
+        #     .cpu()
+        # )
+        raw_exponent = (
+            rans_decomp_triton_tiled(
+                module.exponent_compressed_weight.to("cuda").contiguous(),
+                module.exponent_states.to(torch.int32).to("cuda").contiguous(),
+                module.exponent_tables.to("cuda").contiguous(),
+                module.exponent_slot_map.to("cuda").contiguous(),
+                shape,
+                module.exponent_tile_offsets.to(torch.int32).to("cuda").contiguous(),
+                module.exponent_tile_max_lens.to(torch.int32).to("cuda").contiguous(),
+                tile_k=1024,
+                tile_n=32,
+            )
+            .flatten()
+            .cpu()
+        )
         print("Raw exponent decompressed:", raw_exponent)
 
     else:
@@ -396,19 +577,29 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
             raise RuntimeError(f"Missing mantissa data for {module}")
 
     # Reconstruct tensor (Exp Tensor + Mantissa Tensor -> Tensor)
+    print("Exp shape:", raw_exponent.shape)
+    print("Mantissa interleaved shape:", raw_mantissa.shape)
+
+    # Check that raw_exponent and raw_mantissa have the same number of elements as expected
+    if raw_exponent.numel() != module.expanded_size:
+        raise ValueError(
+            f"Raw exponent size {raw_exponent.numel()} does not match expected {module.expanded_size}"
+        )
+    raw_mantissa = uninterleave_mantissas(
+        raw_mantissa, shape[0], shape[1], TILE_K=1024, TILE_N=32
+    ).view(
+        -1
+    )  # Flatten after uninterleaving
+    if raw_mantissa.numel() != module.expanded_size:
+        raise ValueError(
+            f"Raw mantissa size {raw_mantissa.numel()} does not match expected {module.expanded_size}"
+        )
+
+    print("Mantissa raw after uninterleaving shape:", raw_mantissa.shape)
+
     decompressed_flat = reconstruct_from_exp_and_mantissa(
         raw_exponent, raw_mantissa, dtype=torch.bfloat16
     )
-
-    # Determine Shape
-    if hasattr(module, "input_shape"):
-        shape = module.input_shape
-    elif hasattr(module, "exponent_shape"):
-        shape = module.exponent_shape
-    else:
-        # Dangerous fallback, but prevents crash if shape lost
-        shape = (module.expanded_size,)
-        print(f"Warning: No shape found for {module}, keeping flat.")
 
     # Assign final weight
     module.weight = decompressed_flat.reshape(shape)
