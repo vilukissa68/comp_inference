@@ -28,3 +28,5 @@ from .rans_saving import (
 )
 
 from .rans_gguf import save_rans_model_gguf
+
+from .rans_triton import fused_rans_linear_triton, rans_decomp_triton

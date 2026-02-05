@@ -15,12 +15,17 @@ RansManager::~RansManager() { delete ws; }
 
 RansManager::CompressResult
 RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
-                      const uint16_t *cdf, size_t min_block_size) {
-    auto config =
-        StreamConfigurator<RansConfig8>::suggest(size, min_block_size);
+                      const uint16_t *cdf,
+                      const std::pair<size_t, size_t> shape,
+                      size_t min_block_size) {
 
-    auto gpu_result = rans_compress_cuda<RansConfig8>(ws->internal, data, size,
-                                                      freqs, cdf, config);
+    auto height = shape.first;
+    auto width = shape.second;
+    auto config =
+        StreamConfigurator<RansConfig8>::suggest(height, width, min_block_size);
+
+    auto gpu_result = rans_compress_cuda<RansConfig8>(
+        ws->internal, data, size, freqs, cdf, shape, config);
 
     // std::vector<uint8_t> stream_vec(gpu_result.stream_len);
     std::vector<uint32_t> states_vec(gpu_result.num_streams);

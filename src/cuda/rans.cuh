@@ -96,6 +96,11 @@ template <typename RansConfig> struct RansEncoderCtx {
     // Capacity of each interleaved stream
     uint32_t stream_capacity;
 
+    // Stride between values in a stream, should match width of the tensor for
+    // coalesced access in decoder
+    uint32_t input_height;
+    uint32_t input_width;
+
     // Total number of interleaved streams
     uint32_t num_streams;
 

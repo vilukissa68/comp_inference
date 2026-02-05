@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
+
+from comp_inference.rans_triton import rans_decomp_triton
 from . import ccore
 from typing import Tuple
 
@@ -198,6 +200,11 @@ def rans_compress_module_weight_bf16(
     # 2. Extract
     exponent, mantissa = extract_exp_and_mantissa(module.weight)
 
+    # Print exp rows 510-514 for debugging
+    for i in range(510, 514):
+        detached_row = exponent[i].detach().cpu().numpy()
+        print(f"Exponent row {i}: {detached_row}")
+
     print("Raw exponent before compression:", exponent)
     # 3. Compute LUTs (Assuming get_rans_lut returns Tensors)
     module.exponent_freqs, module.exponent_cdf = get_rans_lut(exponent.to(torch.uint8))
@@ -327,6 +334,16 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         print(f"Skipping {module.compressed}, expected rans_bfloat16.")
         return
 
+    # Determine Shape
+    if hasattr(module, "input_shape"):
+        shape = module.input_shape
+    elif hasattr(module, "exponent_shape"):
+        shape = module.exponent_shape
+    else:
+        # Dangerous fallback, but prevents crash if shape lost
+        shape = (module.expanded_size,)
+        print(f"Warning: No shape found for {module}, keeping flat.")
+
     if hasattr(module, "exponent_compressed_weight"):
         # Create output buffer
         # raw_exponent = ccore.allocate_pinned_tensor(module.expanded_size)
@@ -347,17 +364,28 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
         #     module.exponent_cdf,
         #     raw_exponent,  # Destination
         # )
-        ccore.decompress(
-            module.exponent_compressed_weight.to("cuda").contiguous(),
-            module.exponent_states.to(torch.int32).to("cuda").contiguous(),
-            module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
-            module.exponent_num_streams,
-            module.exponent_tables.to("cuda").contiguous(),
-            module.exponent_slot_map.to("cuda").contiguous(),
-            raw_exponent_cuda.contiguous(),
-        )
+        # ccore.decompress(
+        #     module.exponent_compressed_weight.to("cuda").contiguous(),
+        #     module.exponent_states.to(torch.int32).to("cuda").contiguous(),
+        #     module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
+        #     module.exponent_num_streams,
+        #     module.exponent_tables.to("cuda").contiguous(),
+        #     module.exponent_slot_map.to("cuda").contiguous(),
+        #     raw_exponent_cuda.contiguous(),
+        # )
 
-        raw_exponent = raw_exponent_cuda.cpu().flatten()
+        raw_exponent = (
+            rans_decomp_triton(
+                module.exponent_compressed_weight.to("cuda").contiguous(),
+                module.exponent_states.to(torch.int32).to("cuda").contiguous(),
+                module.exponent_tables.to("cuda").contiguous(),
+                module.exponent_slot_map.to("cuda").contiguous(),
+                module.exponent_output_sizes.to(torch.int32).to("cuda").contiguous(),
+                shape,
+            )
+            .flatten()
+            .cpu()
+        )
         print("Raw exponent decompressed:", raw_exponent)
 
     else:
@@ -399,16 +427,6 @@ def rans_decompress_module_weight_bf16(module: nn.Module) -> None:
     decompressed_flat = reconstruct_from_exp_and_mantissa(
         raw_exponent, raw_mantissa, dtype=torch.bfloat16
     )
-
-    # Determine Shape
-    if hasattr(module, "input_shape"):
-        shape = module.input_shape
-    elif hasattr(module, "exponent_shape"):
-        shape = module.exponent_shape
-    else:
-        # Dangerous fallback, but prevents crash if shape lost
-        shape = (module.expanded_size,)
-        print(f"Warning: No shape found for {module}, keeping flat.")
 
     # Assign final weight
     module.weight = decompressed_flat.reshape(shape)

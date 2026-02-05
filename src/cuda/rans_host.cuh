@@ -155,7 +155,7 @@ struct KernelConfig {
 };
 
 template <typename Config> struct StreamConfigurator {
-    static KernelConfig suggest(size_t total_data_size, size_t min_chunk_size) {
+    static KernelConfig suggest(size_t height, size_t width, size_t B) {
         int device;
         cudaGetDevice(&device);
         cudaDeviceProp prop;
@@ -165,24 +165,12 @@ template <typename Config> struct StreamConfigurator {
         cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &best_block_size,
                                            rans_compress_kernel<Config>, 0, 0);
 
-        // Calculate max streams allowed by data size
-        uint32_t calculated_streams =
-            (total_data_size + min_chunk_size - 1) / min_chunk_size;
+        // --- LOGICAL MAPPING ---
+        // How many segments of height B do we need to cover the total height H?
+        uint32_t segments_per_col = (height + B - 1) / B;
 
-        // Calculate hardware ceiling
-        uint32_t hardware_limit =
-            prop.multiProcessorCount * 32 * best_block_size;
-
-        // Select the smaller of the two
-        uint32_t final_streams = calculated_streams;
-
-        // Ensure at least 1 stream
-        if (final_streams == 0)
-            final_streams = 1;
-
-        // Ensure we don't have more streams than bytes
-        if (final_streams > total_data_size)
-            final_streams = total_data_size;
+        // Total streams = (Segments per Column) * (Number of Columns)
+        uint32_t final_streams = segments_per_col * (uint32_t)width;
 
         return {best_block_size, final_streams};
     }
@@ -201,11 +189,10 @@ template <typename Config> struct RansResultPointers {
 };
 
 template <typename Config>
-RansResultPointers<Config>
-rans_compress_cuda(RansWorkspace<Config> &ws,
-                   const typename Config::symbol_t *host_data,
-                   size_t input_size, const uint16_t *host_freqs,
-                   const uint16_t *host_cdf, KernelConfig k_conf) {
+RansResultPointers<Config> rans_compress_cuda(
+    RansWorkspace<Config> &ws, const typename Config::symbol_t *host_data,
+    size_t input_size, const uint16_t *host_freqs, const uint16_t *host_cdf,
+    const std::pair<size_t, size_t> shape, KernelConfig k_conf) {
     using symbol_t = typename Config::symbol_t;
     using io_t = typename Config::io_t;
     using sym_info_t = typename Config::sym_info_t;
@@ -239,10 +226,15 @@ rans_compress_cuda(RansWorkspace<Config> &ws,
                                input_size * sizeof(symbol_t),
                                cudaMemcpyHostToDevice, stream));
 
+    // Print shape
+    std::cout << "Input shape: (" << shape.first << ", " << shape.second
+              << ")\n";
     RansEncoderCtx<Config> ctx;
     ctx.num_streams = num_streams;
     ctx.stream_capacity = capacity;
     ctx.symbols = ws.d_symbols;
+    ctx.input_height = shape.first;
+    ctx.input_width = shape.second;
     const_cast<uint32_t &>(ctx.input_size) = (uint32_t)input_size;
     ctx.output = ws.d_output;
     ctx.final_states = ws.d_states;

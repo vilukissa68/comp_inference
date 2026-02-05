@@ -29,6 +29,7 @@ class RansManager {
 
     CompressResult compress(const uint8_t *data, size_t size,
                             const uint16_t *freqs, const uint16_t *cdf,
+                            const std::pair<size_t, size_t> shape,
                             size_t min_block_size);
 
     float decompress(const uint8_t *stream, size_t stream_size,

@@ -66,7 +66,7 @@ def main():
             original_weight = module.weight.clone()
 
             # Compress
-            rans_compress_module_weight(module)
+            rans_compress_module_weight(module, block_size=512)
 
             current_slot = module.exponent_slot_map
             current_table = module.exponent_tables
