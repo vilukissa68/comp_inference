@@ -2,6 +2,8 @@
 #include "rans.cuh"
 #include <cuda.h>
 
+#define CHECKPOINT_INTERVAL 128
+
 template <typename RansConfig>
 __global__ void rans_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
 
@@ -55,6 +57,19 @@ __global__ void rans_compress_kernel(RansEncoderCtx<RansConfig> ctx) {
 
     // Compression loop
     for (uint32_t i = 0; i < syms_left; ++i) {
+
+        // Checkpointing
+        if (i % CHECKPOINT_INTERVAL == 0) {
+            uint32_t tile_k_idx = i / CHECKPOINT_INTERVAL;
+            // [32-bit State | 32-bit Out_Idx (Offset)]
+            RansCheckpoint rc;
+            rc.state = state;
+            rc.offset = out_idx;
+            // Store in a strided way so each stream's checkpoints are
+            // contiguous
+            ctx.checkpoints[tile_k_idx * ctx.num_streams + gid] = rc;
+        }
+
         // Read next symbol
         symbol_t s = ctx.symbols[idx];
 
@@ -138,9 +153,9 @@ __global__ void rans_decompress_kernel(RansDecoderCtx<RansConfig> ctx) {
     int32_t stream_offset = (int32_t)stream_size - 1;
 
     uint32_t out_idx = gid;
-    uint32_t out_stride = ctx.num_streams;
+    const uint32_t out_stride = ctx.num_streams;
 
-    uint32_t stride = ctx.num_streams;
+    const uint32_t stride = ctx.num_streams;
     // Points to the *current* byte to be read
     const io_t *input_ptr = ctx.input + (stream_offset * stride) + gid;
     // We also keep the base pointer to check for underflow (safety)
@@ -158,20 +173,13 @@ __global__ void rans_decompress_kernel(RansDecoderCtx<RansConfig> ctx) {
         ctx.output[out_idx] = s;
         out_idx += out_stride;
 
-        // NOTE: Make sure your host code sends RansSymInfoPacked or equivalent
+        // NOTE: Make sure your host code sends RansSymInfoPacked or
+        // equivalent
         sym_info_t info = s_sym_info[s];
 
         // Update State
         state =
             info.freq * (state >> RansConfig::prob_bits) + (slot - info.cdf);
-
-        // Original renormalization loop
-        // while (state < RansConfig::rans_l && stream_offset >= 0) {
-        //     // Read from input stream (Strided Access)
-        // 	io_t value = ctx.input[stream_offset * ctx.num_streams + gid];
-        //     stream_offset--;
-        //     state = (state << RansConfig::io_bits) | value;
-        // }
 
         // NOTE: For int8 IO we know that unrolling twice is enough
         // Unrolled renormalization for up to 2 reads

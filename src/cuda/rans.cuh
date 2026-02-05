@@ -69,6 +69,12 @@ template <typename RansConfig> struct RansTablesFull {
     const symbol_t __restrict__ *slot_to_sym;
 };
 
+// Checkpoint structure for intermediate states
+struct RansCheckpoint {
+    uint32_t state;
+    uint32_t offset;
+};
+
 template <typename RansConfig> struct RansEncoderCtx {
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;
@@ -94,6 +100,7 @@ template <typename RansConfig> struct RansEncoderCtx {
     uint32_t num_streams;
 
     RansTablesCore<RansConfig> tables;
+    RansCheckpoint *checkpoints;
 };
 
 template <typename RansConfig> struct RansDecoderCtx {

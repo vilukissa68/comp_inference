@@ -22,6 +22,7 @@ class RansManager {
         std::vector<uint32_t> sizes;
         std::vector<uint32_t> tables;
         std::vector<uint8_t> slot_map;
+        std::vector<uint64_t> checkpoints;
         uint32_t num_streams;
         size_t stream_len;
     };

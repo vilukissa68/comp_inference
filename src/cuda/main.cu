@@ -49,6 +49,7 @@ template <typename Config> struct RansWorkspace {
     const state_t *d_init_states = nullptr;
     const uint32_t *d_input_sizes = nullptr;
     symbol_t *d_decoded_output = nullptr;
+    RansCheckpoint *d_checkpoints = nullptr;
 
     size_t cap_bytes = 0;
 
@@ -74,6 +75,8 @@ template <typename Config> struct RansWorkspace {
             cudaFree(d_input_sizes);
         if (d_decoded_output)
             cudaFree(d_decoded_output);
+        if (d_checkpoints)
+            cudaFree(d_checkpoints);
     }
 
     void resize(size_t input_sz, uint32_t streams, uint32_t cap_per_stream) {
@@ -89,6 +92,8 @@ template <typename Config> struct RansWorkspace {
                 cudaFree(d_states);
             if (d_sizes)
                 cudaFree(d_sizes);
+            if (d_checkpoints)
+                cudaFree(d_checkpoints);
 
             CUDA_CHECK(cudaMalloc(&d_sym_info,
                                   Config::vocab_size * sizeof(sym_info_t)));
@@ -96,6 +101,8 @@ template <typename Config> struct RansWorkspace {
             CUDA_CHECK(cudaMalloc(&d_output, total_out));
             CUDA_CHECK(cudaMalloc(&d_states, streams * sizeof(state_t)));
             CUDA_CHECK(cudaMalloc(&d_sizes, streams * sizeof(uint32_t)));
+            CUDA_CHECK(
+                cudaMalloc(&d_checkpoints, streams * sizeof(RansCheckpoint)));
             cap_bytes = total_out;
         }
     }
@@ -112,6 +119,12 @@ template <typename Config> struct RansWorkspace {
             CUDA_CHECK(cudaMalloc(&d_input_sizes, streams * sizeof(uint32_t)));
         if (!d_decoded_output)
             CUDA_CHECK(cudaMalloc(&d_decoded_output, out_bytes));
+        if (!d_sym_info)
+            CUDA_CHECK(cudaMalloc(&d_sym_info,
+                                  Config::vocab_size * sizeof(sym_info_t)));
+        if (!d_checkpoints)
+            CUDA_CHECK(
+                cudaMalloc(&d_checkpoints, streams * sizeof(RansCheckpoint)));
     }
 };
 

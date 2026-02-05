@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "cpp/rans.hpp"
+// #include "cpp/rans_linear.hpp"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -18,6 +19,7 @@ struct TensorCompressResult {
     torch::Tensor output_sizes; // int32
     torch::Tensor tables;       // uint32
     torch::Tensor slot_map;     // uint8
+    torch::Tensor checkpoints;  // uint64
     uint32_t num_streams;
     size_t stream_len;
 };
@@ -42,6 +44,18 @@ PYBIND11_MODULE(ccore, m) {
                 slot_map.data_ptr<uint8_t>(), output.data_ptr<uint8_t>());
         },
         "Decompress RANS from GPU tensors to GPU output (Zero Copy)");
+    // m.def(
+    //     "rans_linear",
+    //     [](at::Tensor x, at::Tensor exp_stream, at::Tensor mantissa,
+    //        at::Tensor bias, at::Tensor states, at::Tensor sizes,
+    //        uint32_t num_streams, at::Tensor checkpoints, at::Tensor tables,
+    //        at::Tensor slot_map, at::Tensor output) {
+    //         return fused_rans_linear_cuda(x, exp_stream, mantissa, bias,
+    //         states,
+    //                                       sizes, num_streams, checkpoints,
+    //                                       tables, slot_map, output);
+    //     },
+    //     "Fused RANS Linear GEMM Operation");
     m.def(
         "allocate_pinned_memory",
         [](size_t size) {
@@ -67,20 +81,19 @@ PYBIND11_MODULE(ccore, m) {
                 throw std::runtime_error("Failed to allocate pinned memory");
             }
 
-            // 2. Define a deleter (lambda) that PyTorch calls when the Tensor
-            // dies
+            // 2. Define a deleter (lambda) that PyTorch calls when the
+            // Tensor dies
             auto deleter = [ptr](void *) { cudaFreeHost(ptr); };
 
             // 3. Define Tensor Options
             // CRITICAL: .pinned_memory(true) sets the flag so PyTorch knows
             // it can use DMA for async transfers.
-            auto options =
-                torch::TensorOptions()
-                    .dtype(torch::kUInt8)
-                    .layout(torch::kStrided)
-                    .device(
-                        torch::kCPU) // Pinned memory is technically CPU memory
-                    .pinned_memory(true);
+            auto options = torch::TensorOptions()
+                               .dtype(torch::kUInt8)
+                               .layout(torch::kStrided)
+                               .device(torch::kCPU) // Pinned memory is
+                                                    // technically CPU memory
+                               .pinned_memory(true);
 
             // 4. Create Tensor from raw pointer
             // {static_cast<long>(size)} is the shape (1D)
@@ -98,7 +111,8 @@ PYBIND11_MODULE(ccore, m) {
         .def_readonly("slot_map", &TensorCompressResult::slot_map)
         .def_readonly("output_sizes", &TensorCompressResult::output_sizes)
         .def_readonly("num_streams", &TensorCompressResult::num_streams)
-        .def_readonly("stream_len", &TensorCompressResult::stream_len);
+        .def_readonly("stream_len", &TensorCompressResult::stream_len)
+        .def_readonly("checkpoints", &TensorCompressResult::checkpoints);
 
     py::class_<RansManager::CompressResult>(m, "CompressResult")
         .def_readonly("success", &RansManager::CompressResult::success)
@@ -188,9 +202,16 @@ PYBIND11_MODULE(ccore, m) {
                          {static_cast<long>(res.slot_map.size())},
                          torch::TensorOptions().dtype(torch::kUInt8))
                          .clone();
+                 auto checkpoints_t =
+                     torch::from_blob(
+                         res.checkpoints.data(),
+                         {static_cast<long>(res.checkpoints.size())},
+                         torch::TensorOptions().dtype(torch::kUInt64))
+                         .clone();
                  return TensorCompressResult{
-                     res.success, stream_t,   states_t,        sizes_t,
-                     tables_t,    slot_map_t, res.num_streams, res.stream_len};
+                     res.success,   stream_t,        states_t,
+                     sizes_t,       tables_t,        slot_map_t,
+                     checkpoints_t, res.num_streams, res.stream_len};
              })
 
         .def("decompress",

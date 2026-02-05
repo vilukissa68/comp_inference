@@ -26,10 +26,10 @@ RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
     std::vector<uint32_t> states_vec(gpu_result.num_streams);
     std::vector<uint32_t> sizes_vec(gpu_result.num_streams);
     std::vector<uint32_t> tables_vec(256);
-    // std::vector<uint16_t> slots_vec(4096); // PROB_SCALE = 4096
+    std::vector<uint64_t> checkpoints_vec(
+        gpu_result.num_streams *
+        CHECKPOINT_INTERVAL); // CHECKPOINT_INTERVAL = 128
 
-    // CUDA_CHECK(cudaMemcpy(stream_vec.data(), gpu_result.stream,
-    // gpu_result.stream_len, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(states_vec.data(), gpu_result.final_states,
                           gpu_result.num_streams * sizeof(uint32_t),
                           cudaMemcpyDeviceToHost));
@@ -38,8 +38,10 @@ RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
                           cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(tables_vec.data(), gpu_result.tables,
                           256 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    // CUDA_CHECK(cudaMemcpy(slots_vec.data(), gpu_result.slot_to_sym,
-    //                       4096 * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(checkpoints_vec.data(), gpu_result.checkpoints,
+                          gpu_result.num_streams * CHECKPOINT_INTERVAL *
+                              sizeof(uint64_t),
+                          cudaMemcpyDeviceToHost));
 
     // Find longest stream length
     uint32_t max_len = 0;
@@ -57,16 +59,11 @@ RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
     CUDA_CHECK(cudaMemcpy(stream_vec.data(), gpu_result.stream, trimmed_size,
                           cudaMemcpyDeviceToHost));
 
-    return {
-        gpu_result.success,
-        stream_vec,
-        states_vec,
-        sizes_vec,
-        tables_vec,
-        gpu_result.slot_to_sym,
-        gpu_result.num_streams,
-        stream_vec.size() // Return the TRIMMED size
-    };
+    return {gpu_result.success, stream_vec,
+            states_vec,         sizes_vec,
+            tables_vec,         gpu_result.slot_to_sym,
+            checkpoints_vec,    gpu_result.num_streams,
+            stream_vec.size()};
 }
 
 float RansManager::decompress(const uint8_t *stream, size_t stream_size,

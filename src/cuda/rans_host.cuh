@@ -41,6 +41,7 @@ template <typename Config> struct RansWorkspace {
     state_t *d_init_states = nullptr;
     uint32_t *d_input_sizes = nullptr;
     symbol_t *d_decoded_output = nullptr;
+    RansCheckpoint *d_checkpoints = nullptr;
 
     // Individual Capacities (in bytes) to prevent overflow
     size_t cap_sym_info = 0;
@@ -53,6 +54,7 @@ template <typename Config> struct RansWorkspace {
     size_t cap_init_states = 0;
     size_t cap_input_sizes = 0;
     size_t cap_decoded_output = 0;
+    size_t cap_checkpoints = 0;
 
     RansWorkspace() = default;
 
@@ -110,6 +112,8 @@ template <typename Config> struct RansWorkspace {
             cudaFree(d_input_sizes);
         if (d_decoded_output)
             cudaFree(d_decoded_output);
+        if (d_checkpoints)
+            cudaFree(d_checkpoints);
     }
 
     void resize(size_t input_sz_bytes, uint32_t streams,
@@ -124,6 +128,9 @@ template <typename Config> struct RansWorkspace {
                           streams * sizeof(state_t));
         realloc_if_needed((void **)&d_sizes, cap_sizes,
                           streams * sizeof(uint32_t));
+        realloc_if_needed((void **)&d_checkpoints, cap_checkpoints,
+                          streams * CHECKPOINT_INTERVAL *
+                              sizeof(RansCheckpoint));
     }
 
     void resize_dec(size_t in_bytes, size_t out_bytes, uint32_t streams) {
@@ -136,6 +143,9 @@ template <typename Config> struct RansWorkspace {
                           streams * sizeof(uint32_t));
         realloc_if_needed((void **)&d_decoded_output, cap_decoded_output,
                           out_bytes);
+        realloc_if_needed((void **)&d_checkpoints, cap_checkpoints,
+                          streams * CHECKPOINT_INTERVAL *
+                              sizeof(RansCheckpoint));
     }
 };
 
@@ -187,6 +197,7 @@ template <typename Config> struct RansResultPointers {
     size_t stream_len;
     typename Config::sym_info_t *tables;                // 256 values
     std::vector<typename Config::symbol_t> slot_to_sym; // PROB_SCALE values
+    RansCheckpoint *checkpoints; // num_streams * CHECKPOINT_INTERVAL
 };
 
 template <typename Config>
@@ -237,6 +248,7 @@ rans_compress_cuda(RansWorkspace<Config> &ws,
     ctx.final_states = ws.d_states;
     ctx.output_sizes = ws.d_sizes;
     ctx.tables.sym_info = ws.d_sym_info;
+    ctx.checkpoints = ws.d_checkpoints;
 
     int block = k_conf.block_size;
     int grid = (num_streams + block - 1) / block;
@@ -253,9 +265,10 @@ rans_compress_cuda(RansWorkspace<Config> &ws,
         ws.d_sizes,  // Length of each stream
         num_streams, // Number of streams
         (size_t)num_streams *
-            capacity,  // Total allocated stream length in bytes
-        ws.d_sym_info, // Symbol info table
-        host_slot_map  // Slot to symbol map
+            capacity,    // Total allocated stream length in bytes
+        ws.d_sym_info,   // Symbol info table
+        host_slot_map,   // Slot to symbol map
+        ws.d_checkpoints // Checkpoints
     };
 }
 
