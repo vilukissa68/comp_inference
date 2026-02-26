@@ -4,90 +4,245 @@
 
 #define CHECKPOINT_INTERVAL 128
 
-// template <typename RansConfig>
-// __global__ void
-// rans_compress_kernel_tiled(RansTiledEncoderCtx<RansConfig> ctx) {
-//     using symbol_t = typename RansConfig::symbol_t;
-//     using state_t = typename RansConfig::state_t;
-//     using io_t = typename RansConfig::io_t;
-//     using sym_info_t = typename RansConfig::sym_info_t;
+template <typename RansConfig>
+__global__ void
+rans_compress_kernel_tiled_ilp2(RansTiledEncoderCtx<RansConfig> ctx) {
+    using symbol_t = typename RansConfig::symbol_t;
+    using state_t = typename RansConfig::state_t;
+    using io_t = typename RansConfig::io_t;
+    using sym_info_t = typename RansConfig::sym_info_t;
 
-//     // Load symbol info table into shared memory for fast access
-//     __shared__ sym_info_t s_sym_info[256];
+    // 1. Load symbol info table into shared memory
+    __shared__ sym_info_t s_sym_info[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        s_sym_info[i] = ctx.tables.sym_info[i];
+    }
+    __syncthreads();
 
-//     // Cooperative loading (all threads help load the table)
-//     for (int i = threadIdx.x; i < 256; i += ctx.tile_width) {
-//         s_sym_info[i] = ctx.tables.sym_info[i];
-//     }
+    uint32_t tile_idx_n = blockIdx.x;
+    uint32_t tile_idx_k = blockIdx.y;
 
-//     __syncthreads();
+    // Thread handles ONE column, but outputs TWO streams (Top and Bottom
+    // halves)
+    uint32_t local_col = threadIdx.x;
+    uint32_t global_col = tile_idx_n * ctx.tile_width + local_col;
 
-//     // Map GID to 2D tile grid
-//     uint32_t tile_idx_n = blockIdx.x; // Tile x coordinate
-//     uint32_t tile_idx_k = blockIdx.y; // Tile y coordinate
-//     uint32_t local_col = threadIdx.x; // Width of tile
+    if (global_col >= ctx.total_width)
+        return;
 
-//     uint32_t values_encoded = 0;
+    // --- ILP MAPPING ---
+    // Every tile now produces (tile_width * 2) streams.
+    // We group all Top Half streams together, then all Bottom Half streams
+    // together to ensure coalesced memory reads in the Triton decompressor.
+    uint32_t base_stream_idx =
+        (tile_idx_k * ctx.num_tiles_n + tile_idx_n) * (ctx.tile_width * 2);
 
-//     uint32_t N = ctx.total_width;
-//     uint32_t K = ctx.total_height;
+    uint32_t global_stream_id_A = base_stream_idx + local_col; // Top Half
+    uint32_t global_stream_id_B =
+        base_stream_idx + ctx.tile_width + local_col; // Bottom Half
 
-//     uint32_t global_stream_id =
-//         (tile_idx_k * ctx.num_tiles_n + tile_idx_n) * ctx.tile_width +
-//         local_col;
-//     if (global_stream_id >= ctx.num_streams)
-//         return;
+    state_t state_A = RansConfig::rans_l;
+    state_t state_B = RansConfig::rans_l;
 
-//     uint32_t global_col = tile_idx_n * ctx.tile_width + local_col;
-//     if (global_col >= ctx.total_width)
-//         return;
+    uint32_t out_idx_A = 0;
+    uint32_t out_idx_B = 0;
+    uint32_t values_encoded_A = 0;
+    uint32_t values_encoded_B = 0;
 
-//     state_t state = RansConfig::rans_l;
-//     uint32_t out_idx = 0;
-//     uint32_t start_row = tile_idx_k * ctx.tile_height; // Start from the
+    uint32_t start_row = tile_idx_k * ctx.tile_height;
+    uint32_t half_tile = ctx.tile_height / 2;
+    const state_t x_max_base =
+        ((RansConfig::rans_l >> RansConfig::prob_bits) << RansConfig::io_bits);
 
-//     const state_t x_max_base =
-//         ((RansConfig::rans_l >> RansConfig::prob_bits) <<
-//         RansConfig::io_bits);
+    // --- COMPUTE PHASE B: Bottom Half (Rows: tile_height-1 down to half_tile)
+    // ---
+    for (int i = (int)ctx.tile_height - 1; i >= (int)half_tile; --i) {
+        uint32_t row = start_row + i;
+        if (row >= ctx.total_height)
+            continue;
 
-//     uint32_t tile_id = (tile_idx_k * ctx.num_tiles_n + tile_idx_n);
-//     uint32_t tile_base_offset =
-//         tile_id * (ctx.stream_capacity * ctx.tile_width);
+        symbol_t sym = ctx.symbols[row * ctx.total_width + global_col];
+        auto info = s_sym_info[sym];
+        state_t x_max = x_max_base * info.freq;
 
-//     for (int i = (int)ctx.tile_height - 1; i >= 0; --i) {
-//         uint32_t row = start_row + i;
-//         if (row >= K) {
-//             continue;
-//         }
+        values_encoded_B++;
+        while (state_B >= x_max) {
+            if (out_idx_B < ctx.stream_capacity) {
+                // ctx.num_streams here MUST be the doubled total!
+                ctx.output[out_idx_B * ctx.num_streams + global_stream_id_B] =
+                    (io_t)(state_B & RansConfig::io_mask);
+                out_idx_B++;
+            } else {
+                ctx.success = false;
+                break;
+            }
+            state_B >>= RansConfig::io_bits;
+        }
+        state_B = ((state_B / info.freq) << RansConfig::prob_bits) +
+                  (state_B % info.freq) + info.cdf;
+    }
 
-//         symbol_t symbol = ctx.symbols[row * N + global_col];
-//         values_encoded++;
-//         auto info = s_sym_info[symbol];
+    // --- COMPUTE PHASE A: Top Half (Rows: half_tile-1 down to 0) ---
+    for (int i = (int)half_tile - 1; i >= 0; --i) {
+        uint32_t row = start_row + i;
+        if (row >= ctx.total_height)
+            continue;
 
-//         // Renormalization
-//         state_t x_max = x_max_base * info.freq;
-//         while (state >= x_max) {
-//             if (out_idx < ctx.stream_capacity) { // Guard against overflow
-//                 ctx.output[out_idx * ctx.num_streams + global_stream_id] =
-//                     (io_t)(state & RansConfig::io_mask);
-//                 out_idx++;
-//             } else {
-//                 ctx.success = false; // Mark failure
-//                 break;
-//             }
+        symbol_t sym = ctx.symbols[row * ctx.total_width + global_col];
+        auto info = s_sym_info[sym];
+        state_t x_max = x_max_base * info.freq;
 
-//             state >>= RansConfig::io_bits;
-//         }
-//         // Update state
-//         state = ((state / info.freq) << RansConfig::prob_bits) +
-//                 (state % info.freq) + info.cdf;
-//     }
+        values_encoded_A++;
+        while (state_A >= x_max) {
+            if (out_idx_A < ctx.stream_capacity) {
+                ctx.output[out_idx_A * ctx.num_streams + global_stream_id_A] =
+                    (io_t)(state_A & RansConfig::io_mask);
+                out_idx_A++;
+            } else {
+                ctx.success = false;
+                break;
+            }
+            state_A >>= RansConfig::io_bits;
+        }
+        state_A = ((state_A / info.freq) << RansConfig::prob_bits) +
+                  (state_A % info.freq) + info.cdf;
+    }
 
-//     // Record the actual work done for C++ post-processing
-//     ctx.final_states[global_stream_id] = state;
-//     ctx.stream_sizes[global_stream_id] = out_idx;
-//     ctx.values_encoded[global_stream_id] = values_encoded;
-// }
+    // --- WRITEBACK PHASE ---
+    ctx.final_states[global_stream_id_A] = state_A;
+    ctx.stream_sizes[global_stream_id_A] = out_idx_A;
+    ctx.values_encoded[global_stream_id_A] = values_encoded_A;
+
+    ctx.final_states[global_stream_id_B] = state_B;
+    ctx.stream_sizes[global_stream_id_B] = out_idx_B;
+    ctx.values_encoded[global_stream_id_B] = values_encoded_B;
+}
+
+template <typename RansConfig>
+__global__ void
+rans_compress_kernel_tiled_ilp(RansTiledEncoderCtx<RansConfig> ctx) {
+    using symbol_t = typename RansConfig::symbol_t;
+    using state_t = typename RansConfig::state_t;
+    using io_t = typename RansConfig::io_t;
+    using sym_info_t = typename RansConfig::sym_info_t;
+
+    // Load symbol info table into shared memory
+    __shared__ sym_info_t s_sym_info[256];
+
+    // Cooperative loading using blockDim.x (32 threads)
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        s_sym_info[i] = ctx.tables.sym_info[i];
+    }
+    __syncthreads();
+
+    uint32_t tile_idx_n = blockIdx.x;
+    uint32_t tile_idx_k = blockIdx.y;
+
+    // --- ILP MAPPING ---
+    // Thread handles two columns offset by blockDim.x (e.g., 0 and 32)
+    uint32_t local_col_A = threadIdx.x;
+    uint32_t local_col_B = threadIdx.x + blockDim.x;
+
+    uint32_t N = ctx.total_width;
+    uint32_t K = ctx.total_height;
+
+    uint32_t global_stream_id_A =
+        (tile_idx_k * ctx.num_tiles_n + tile_idx_n) * ctx.tile_width +
+        local_col_A;
+    uint32_t global_stream_id_B =
+        (tile_idx_k * ctx.num_tiles_n + tile_idx_n) * ctx.tile_width +
+        local_col_B;
+
+    uint32_t global_col_A = tile_idx_n * ctx.tile_width + local_col_A;
+    uint32_t global_col_B = tile_idx_n * ctx.tile_width + local_col_B;
+
+    bool valid_A = (global_stream_id_A < ctx.num_streams) && (global_col_A < N);
+    bool valid_B = (global_stream_id_B < ctx.num_streams) && (global_col_B < N);
+
+    // If both are out of bounds, bail early
+    if (!valid_A && !valid_B)
+        return;
+
+    state_t state_A = RansConfig::rans_l;
+    state_t state_B = RansConfig::rans_l;
+
+    uint32_t out_idx_A = 0;
+    uint32_t out_idx_B = 0;
+    uint32_t values_encoded_A = 0;
+    uint32_t values_encoded_B = 0;
+
+    uint32_t start_row = tile_idx_k * ctx.tile_height;
+    const state_t x_max_base =
+        ((RansConfig::rans_l >> RansConfig::prob_bits) << RansConfig::io_bits);
+
+    for (int i = (int)ctx.tile_height - 1; i >= 0; --i) {
+        uint32_t row = start_row + i;
+        if (row >= K)
+            continue;
+
+        // --- MEMORY FETCH PHASE ---
+        // Both threads fetch simultaneously (Coalesced reads!)
+        symbol_t sym_A = valid_A ? ctx.symbols[row * N + global_col_A] : 0;
+        symbol_t sym_B = valid_B ? ctx.symbols[row * N + global_col_B] : 0;
+
+        auto info_A = s_sym_info[sym_A];
+        auto info_B = s_sym_info[sym_B];
+
+        state_t x_max_A = x_max_base * info_A.freq;
+        state_t x_max_B = x_max_base * info_B.freq;
+
+        // --- COMPUTE PHASE A ---
+        if (valid_A) {
+            values_encoded_A++;
+            while (state_A >= x_max_A) {
+                if (out_idx_A < ctx.stream_capacity) {
+                    ctx.output[out_idx_A * ctx.num_streams +
+                               global_stream_id_A] =
+                        (io_t)(state_A & RansConfig::io_mask);
+                    out_idx_A++;
+                } else {
+                    ctx.success = false;
+                    break;
+                }
+                state_A >>= RansConfig::io_bits;
+            }
+            state_A = ((state_A / info_A.freq) << RansConfig::prob_bits) +
+                      (state_A % info_A.freq) + info_A.cdf;
+        }
+
+        // --- COMPUTE PHASE B ---
+        // (Compiler interleaves this with Phase A)
+        if (valid_B) {
+            values_encoded_B++;
+            while (state_B >= x_max_B) {
+                if (out_idx_B < ctx.stream_capacity) {
+                    ctx.output[out_idx_B * ctx.num_streams +
+                               global_stream_id_B] =
+                        (io_t)(state_B & RansConfig::io_mask);
+                    out_idx_B++;
+                } else {
+                    ctx.success = false;
+                    break;
+                }
+                state_B >>= RansConfig::io_bits;
+            }
+            state_B = ((state_B / info_B.freq) << RansConfig::prob_bits) +
+                      (state_B % info_B.freq) + info_B.cdf;
+        }
+    }
+
+    // --- WRITEBACK PHASE ---
+    if (valid_A) {
+        ctx.final_states[global_stream_id_A] = state_A;
+        ctx.stream_sizes[global_stream_id_A] = out_idx_A;
+        ctx.values_encoded[global_stream_id_A] = values_encoded_A;
+    }
+    if (valid_B) {
+        ctx.final_states[global_stream_id_B] = state_B;
+        ctx.stream_sizes[global_stream_id_B] = out_idx_B;
+        ctx.values_encoded[global_stream_id_B] = values_encoded_B;
+    }
+}
 
 template <typename RansConfig>
 __global__ void

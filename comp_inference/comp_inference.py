@@ -67,18 +67,89 @@ def interleave_mantissas(mantissas: torch.Tensor, TILE_K=1024, TILE_N=32):
 def uninterleave_mantissas(interleaved_mantissas, K, N, TILE_K=1024, TILE_N=32):
     """
     Reverses the tiled interleaving to restore a standard [K, N] layout.
+    Dynamically pads missing elements if the tensor was truncated during saving.
     """
     num_tiles_k = (K + TILE_K - 1) // TILE_K
     num_tiles_n = (N + TILE_N - 1) // TILE_N
 
+    expected_size = num_tiles_k * num_tiles_n * TILE_K * TILE_N
+
+    # --- THE FIX: Dynamically restore missing padding ---
+    actual_size = interleaved_mantissas.numel()
+    if actual_size < expected_size:
+        pad_len = expected_size - actual_size
+        # Append zeros to the end of the 1D tensor to complete the grid
+        interleaved_mantissas = torch.nn.functional.pad(
+            interleaved_mantissas, (0, pad_len)
+        )
+
     # Reshape back to the tiled structure
     tiled = interleaved_mantissas.view(num_tiles_k, num_tiles_n, TILE_K, TILE_N)
 
-    # Permute back to [num_tiles_k, TILE_K, num_tiles_n, TILE_N]
-    # This matches the logical row/column order
+    # Permute back to logical row/column order
     restored = tiled.permute(0, 2, 1, 3).contiguous()
 
-    # Flatten to [K_padded, N_padded] and crop to actual K, N
+    # Flatten and crop the padding back off to return exactly [K, N]
+    return restored.view(num_tiles_k * TILE_K, num_tiles_n * TILE_N)[:K, :N]
+
+
+def interleave_mantissas_ilp2(mantissas: torch.Tensor, TILE_K=128, TILE_N=64):
+    """
+    Physically rearranges mantissas for ILP2.
+    For each tile, it stores:
+    [All Top-Half Rows (0 to K/2), All Bottom-Half Rows (K/2 to K)]
+    """
+    K, N = mantissas.shape
+    num_tiles_k = (K + TILE_K - 1) // TILE_K
+    num_tiles_n = (N + TILE_N - 1) // TILE_N
+
+    # 1. Pad to tile boundaries
+    pad_k = num_tiles_k * TILE_K - K
+    pad_n = num_tiles_n * TILE_N - N
+    if pad_k > 0 or pad_n > 0:
+        mantissas = torch.nn.functional.pad(mantissas, (0, pad_n, 0, pad_k), value=0)
+
+    # 2. Reshape into [num_k, TILE_K, num_n, TILE_N]
+    tiled = mantissas.view(num_tiles_k, TILE_K, num_tiles_n, TILE_N)
+
+    # 3. Permute to Tile-Major: [num_k, num_n, TILE_K, TILE_N]
+    tiled = tiled.permute(0, 2, 1, 3).contiguous()
+
+    # --- THE ILP2 CHANGE ---
+    # Split the TILE_K dimension (dim 2) into two halves
+    half_k = TILE_K // 2
+    top_half = tiled[:, :, :half_k, :]
+    bottom_half = tiled[:, :, half_k:, :]
+
+    # Concatenate them so Top-Half of the tile comes first in memory
+    # Resulting shape: [num_k, num_n, 2, half_k, TILE_N]
+    # This ensures that when the kernel jumps by TILE_N, it stays in the right 'half'
+    ilp2_tiled = torch.stack([top_half, bottom_half], dim=2)
+
+    return ilp2_tiled.contiguous().view(-1)
+
+
+def uninterleave_mantissas_ilp2(interleaved, K, N, TILE_K=128, TILE_N=64):
+    num_tiles_k = (K + TILE_K - 1) // TILE_K
+    num_tiles_n = (N + TILE_N - 1) // TILE_N
+    half_k = TILE_K // 2
+
+    # Reshape back to the 5D ILP2 structure
+    tiled = interleaved.view(num_tiles_k, num_tiles_n, 2, half_k, TILE_N)
+
+    # Extract the halves
+    top_half = tiled[:, :, 0, :, :]
+    bottom_half = tiled[:, :, 1, :, :]
+
+    # Concatenate back into a full TILE_K
+    full_tiles = torch.cat(
+        [top_half, bottom_half], dim=2
+    )  # [num_k, num_n, TILE_K, TILE_N]
+
+    # Permute back to logical order
+    restored = full_tiles.permute(0, 2, 1, 3).contiguous()
+
+    # Crop padding
     return restored.view(num_tiles_k * TILE_K, num_tiles_n * TILE_N)[:K, :N]
 
 
@@ -360,16 +431,28 @@ def rans_compress_module_weight_bf16(
         mantissa_interleaved = interleave_mantissas(
             mantissa, TILE_K=tile_height, TILE_N=tile_width
         )
+        # mantissa_interleaved = interleave_mantissas_ilp2(
+        #     mantissa, TILE_K=tile_height, TILE_N=tile_width
+        # )
+
         mantissa_interleaved_copy = (
             mantissa_interleaved.clone()
         )  # Keep a copy for verification
         mantissa_uninterleaved = uninterleave_mantissas(
             mantissa_interleaved_copy, K, N, TILE_K=tile_height, TILE_N=tile_width
         )
+        # mantissa_uninterleaved = uninterleave_mantissas_ilp2(
+        #     mantissa_interleaved_copy, K, N, TILE_K=tile_height, TILE_N=tile_width
+        # )
 
         if not torch.equal(mantissa, mantissa_uninterleaved):
             print(
                 "Warning: Interleaving and uninterleaving mantissa did not perfectly restore original. There may be an issue with the interleaving logic."
+            )
+            exit(1)
+        else:
+            print(
+                "Success: Interleaving and uninterleaving mantissa perfectly restored original."
             )
 
         # Check that interleaved mantissa is actually different from original mantissa

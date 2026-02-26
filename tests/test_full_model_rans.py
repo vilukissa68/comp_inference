@@ -39,7 +39,7 @@ def main():
     args = parser.parse_args()
 
     print("Full Model Round-Trip rANS Compression Test")
-    model_name = "Qwen/Qwen3-0.6B"
+    model_name = args.model_name
 
     print(f"Loading {model_name} in Bfloat16...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -71,6 +71,18 @@ def main():
             name == "model.embed_tokens" or name == "model.lm_head" or name == "lm_head"
         ) and args.skip_embedding:
             print("Skipping compressing embedding layer.")
+            continue
+
+        # Embedding and lm head, shouldn't be transposed
+        if name == "model.embed_tokens" or name == "model.lm_head" or name == "lm_head":
+            print(f"Compressing embedding/lm_head layer: {name}")
+            rans_compress_module_weight(
+                module,
+                tile_height=args.tile_height,
+                tile_width=args.tile_width,
+                transpose_weight=False,
+            )
+            layers_compressed += 1
             continue
 
         # QKV fusion
@@ -115,7 +127,13 @@ def main():
                 print(f"Warning: Compression failed for {name}")
     print("Compression phase completed.")
     pack_and_save_tensors(model, "compressed_model.safetensors")
-    save_rans_model_package(model, tokenizer, "model")
+
+    model_name_clean = model_name.replace("/", "_")
+    save_rans_model_package(model, tokenizer, model_name_clean)
+    print(
+        "Model compressed and saved to disk. You can now run the decompression and verification steps separately if desired."
+    )
+    exit(0)
     save_rans_model_gguf(model, tokenizer, "compressed_model.gguf", model_name)
     del model  # Free memory
 

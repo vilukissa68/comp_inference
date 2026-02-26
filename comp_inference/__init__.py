@@ -32,7 +32,19 @@ from .rans_saving import (
 from .rans_gguf import save_rans_model_gguf
 
 from .rans_triton import (
-    fused_rans_linear_triton,
     rans_decomp_triton,
     rans_decomp_triton_tiled,
+)
+
+from .linear_triton import (
+    fused_rans_linear_triton,
+)
+
+
+from .transposed_linear_triton import (
+    fused_rans_linear_transposed_triton,
+)
+
+from .embedding_triton import (
+    fused_rans_embedding_triton,
 )

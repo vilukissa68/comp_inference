@@ -317,7 +317,9 @@ RansTiledResultPointers<Config> rans_compress_tiled_cuda(
     uint32_t num_tiles_k = (K + tile_height - 1) / tile_height;
     uint32_t num_tiles_n = (N + tile_width - 1) / tile_width;
     uint32_t total_tiles = num_tiles_k * num_tiles_n;
-    uint32_t num_streams = total_tiles * tile_width;
+    // uint32_t num_streams = total_tiles * tile_width;
+    //  ILP 2
+    uint32_t num_streams = total_tiles * tile_width * 2;
 
     std::cout << "Calculated num tiles K: " << num_tiles_k
               << ", num tiles N: " << num_tiles_n
@@ -394,9 +396,13 @@ RansTiledResultPointers<Config> rans_compress_tiled_cuda(
               << ", total streams: " << num_streams
               << ", capacity per stream: " << capacity << "\n";
 
-    dim3 block(tile_width, 1);           // width, height
+    size_t threads_ilp = tile_width / 2;
+
+    dim3 block(tile_width, 1); // width, height
+    // dim3 block(threads_ilp, 1);          // width, height
     dim3 grid(num_tiles_n, num_tiles_k); // width, height
-    rans_compress_kernel_tiled<Config><<<grid, block, 0, stream>>>(ctx);
+    // rans_compress_kernel_tiled<Config><<<grid, block, 0, stream>>>(ctx);
+    rans_compress_kernel_tiled_ilp2<Config><<<grid, block, 0, stream>>>(ctx);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // --- 5. RETURN TILED RESULT ---

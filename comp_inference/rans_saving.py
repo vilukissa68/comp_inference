@@ -33,12 +33,10 @@ def save_rans_model_package(
                 module, "exponent_tile_width", getattr(module, "tile_width", 32)
             )
 
-            print("Before:", name)
             if "gate_proj" in name:
                 name = name.replace("gate_proj", "gate_up_proj")
             elif "q_proj" in name:
                 name = name.replace("q_proj", "qkv_proj")
-            print("After:", name)
 
             # Name will be exactly as it appears in the model structure
             layer_configs[name] = {"tile_height": th, "tile_width": tw}
@@ -197,9 +195,9 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
         tensors[f"{base_name}{p}rans_man_states"] = module.mantissa_states.cpu().to(
             torch.uint32
         )
-        tensors[
-            f"{base_name}{p}rans_man_sizes"
-        ] = module.mantissa_output_sizes.cpu().to(torch.uint32)
+        # tensors[
+        #     f"{base_name}{p}rans_man_sizes"
+        # ] = module.mantissa_output_sizes.cpu().to(torch.uint32)
         tensors[f"{base_name}{p}rans_man_freqs"] = module.mantissa_freqs.cpu().to(
             torch.uint16
         )
