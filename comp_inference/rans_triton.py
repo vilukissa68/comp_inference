@@ -323,14 +323,6 @@ def rans_decomp_triton(
 
     grid = lambda meta: (triton.cdiv(num_streams, meta["BLOCK_SIZE"]),)
 
-    print("Output Shape:", output_shape)
-    print("Num Streams:", num_streams)
-    print("Num initial states:", len(initial_states))
-    print("Num stream sizes:", len(stream_sizes))
-    print(f"Tables Dtype: {tables.dtype}")
-    print(f"DEBUG: Max initial state: {initial_states.max()}")
-    print(f"DEBUG: Max stream size: {stream_sizes.max()}")
-    print(f"DEBUG: Slot map sum: {slot_map.sum()}")
     rans_decompress_kernel_triton[grid](
         compressed_streams,
         initial_states=initial_states,
@@ -347,8 +339,6 @@ def rans_decomp_triton(
         BLOCK_SIZE=128,
         num_warps=4,
     )
-
-    print("Decomp kernel done.")
 
     return output
 
@@ -483,6 +473,12 @@ def rans_decompress_tiled_kernel_triton(
     start_row = pid_k * TILE_K
     syms_in_tile = tl.minimum(TILE_K, total_height - start_row)
 
+    # Hoist kernel-invariant computations outside the decode loop
+    # actual_tile_width only depends on pid_n/TILE_N/total_width, all fixed per CTA
+    actual_tile_width = tl.minimum(TILE_N, total_width - pid_n * TILE_N)
+    # Precompute the column component of the output pointer (invariant across rows)
+    out_col_base = output + global_col.to(tl.int64)
+
     # 4. Decoding Loop
     for i in range(TILE_K):
         row_mask = n_mask & (i < syms_in_tile)
@@ -491,12 +487,8 @@ def rans_decompress_tiled_kernel_triton(
         slot = state & PROB_MASK
         symbol = tl.load(slot_map + slot, mask=row_mask, other=0)
 
-        # Store Result
-        out_ptr = (
-            output
-            + (start_row + i).to(tl.int64) * total_width
-            + global_col.to(tl.int64)
-        )
+        # Store Result (reuse precomputed column base)
+        out_ptr = out_col_base + (start_row + i) * total_width
         tl.store(out_ptr, symbol, mask=row_mask)
 
         # Update State
@@ -513,17 +505,13 @@ def rans_decompress_tiled_kernel_triton(
             # (current_byte_row >= 0) stops us from hitting the padding at index 0
             needs_renorm = (state < RANS_L) & row_mask & (current_byte_row >= 0)
 
-            # Dynamically calculate how many active streams exist in this specific tile
-            actual_tile_width = tl.minimum(TILE_N, total_width - pid_n * TILE_N)
-
-            # Use the actual width as the memory stride
+            # Use the actual width as the memory stride (precomputed outside loop)
             ptr = (
                 compressed_data
                 + tile_start
                 + (current_byte_row * actual_tile_width)
                 + lane_id
             )
-            # ptr = compressed_data + tile_start + (current_byte_row * TILE_N) + lane_id
             val = tl.load(ptr, mask=needs_renorm, other=0).to(tl.uint32)
 
             state = tl.where(needs_renorm, (state << 8) | val, state)
@@ -558,21 +546,6 @@ def rans_decomp_triton_tiled(
     num_tiles_k = (K + tile_k - 1) // tile_k
     # num_tiles_n = triton.cdiv(N, tile_n)
     # num_tiles_k = triton.cdiv(K, tile_k)
-
-    print("K:", K)
-    print("N:", N)
-
-    print("TILE_K:", tile_k)
-    print("TILE_N:", tile_n)
-
-    print("Num Tiles K:", num_tiles_k)
-    print("Num Tiles N:", num_tiles_n)
-
-    print("Output shape:", output.shape)
-
-    print("Tile offsets:", tile_offsets.shape)
-    print("Tile offset[0]", tile_offsets[0])
-    print("Tile max lens:", tile_max_lens.shape)
 
     # 3. Grid: (Number of Tiles in N, Number of Tiles in K)
     grid = (num_tiles_n, num_tiles_k)
@@ -788,6 +761,15 @@ def fused_rans_matmul_kernel_with_bias(
     acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
     global_n = pid_n * TILE_N + lane_id
 
+    # Hoist kernel-invariant computations outside all loops
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    n_valid = global_n < N
+    m_valid = offs_m < M
+    # Precompute row base pointers for x to avoid recomputing offs_m * stride_am each block
+    x_row_ptrs = x_ptr + offs_m * stride_am
+    # Hoist the arange used for w_tile scatter; BLOCK_K is constexpr so this is a constant
+    bk_range = tl.arange(0, BLOCK_K)
+
     for k_tile_idx in range(0, tl.cdiv(K, TILE_K)):
         # tile_id identifies the [TILE_K, TILE_N] block
         tile_id = k_tile_idx * num_tiles_n + pid_n
@@ -800,57 +782,59 @@ def fused_rans_matmul_kernel_with_bias(
         state = tl.load(initial_states + (tile_id * TILE_N + lane_id)).to(tl.uint32)
         current_byte_row = tl.full((TILE_N,), tile_depth - 1, dtype=tl.int64)
 
-        # 2. Local accumulator strictly for this 1024-element chunk
+        # 2. Local accumulator strictly for this chunk
         local_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+
+        # Hoist tile-level invariants: mantissa base and renorm pointer base
+        tile_man_base = tile_id * TILE_K * TILE_N
+        tile_data_base = compressed_data + tile_start + lane_id
 
         for bk_start in range(0, TILE_K, BLOCK_K):
             w_tile = tl.zeros((BLOCK_K, TILE_N), dtype=tl.bfloat16)
 
+            # Hoist per-block constants to reduce arithmetic inside the inner loop
+            k_base = k_tile_idx * TILE_K + bk_start
+            # bk_man_base includes lane_id so inner loop just adds i * TILE_N (constexpr stride)
+            bk_man_base = tile_man_base + bk_start * TILE_N + lane_id
+
             for i in range(BLOCK_K):
-                k_idx = k_tile_idx * TILE_K + bk_start + i
                 # fmt: off
-                mask_k = (k_idx < K) & (global_n < N)
+                mask_k = ((k_base + i) < K) & n_valid
                 # fmt: on
 
                 # Decode
                 slot = state & PROB_MASK
                 exp_sym = tl.load(slot_map + slot, mask=mask_k, other=0).to(tl.uint16)
 
-                # Mantissa Indexing
-                m_offset = (
-                    (tile_id * TILE_K * TILE_N) + ((bk_start + i) * TILE_N) + lane_id
-                )
-                raw_man = tl.load(mantissas_ptr + m_offset, mask=mask_k, other=0).to(
-                    tl.uint16
-                )
+                # Mantissa Indexing: base precomputed outside inner loop
+                raw_man = tl.load(
+                    mantissas_ptr + bk_man_base + i * TILE_N, mask=mask_k, other=0
+                ).to(tl.uint16)
 
-                # --- BF16 RECONSTRUCT FIX ---
-                # Combine components into a 16-bit word (stored in a 32-bit register initially)
+                # --- BF16 RECONSTRUCT ---
+                # exp_sym is a byte-range symbol (0-255) loaded as uint16; no & 0xFF needed
+                # packed >> 16 fits in 16 bits (CDF ≤ PROB_MASK < 32768); no & 0xFFFF needed
                 w_int = (
-                    ((raw_man & 0x80) << 8) | ((exp_sym & 0xFF) << 7) | (raw_man & 0x7F)
+                    ((raw_man & 0x80) << 8) | (exp_sym << 7) | (raw_man & 0x7F)
                 )
 
                 # Narrow to 16 bits, then reinterpret as bf16
                 w_val = w_int.to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
-                # Stack row into w_tile
-                row_mask = tl.arange(0, BLOCK_K) == i
+                # Stack row into w_tile (bk_range is hoisted; Triton unrolls the == i check)
+                row_mask = bk_range == i
                 w_tile = tl.where(row_mask[:, None], w_val[None, :], w_tile)
 
                 # State Update
                 packed = tl.load(tables + exp_sym, mask=mask_k, other=0)
                 state = (packed & 0xFFFF) * (state >> PROB_BITS) + (
-                    slot - ((packed >> 16) & 0xFFFF)
+                    slot - (packed >> 16)
                 )
 
                 for _ in range(2):
                     needs_renorm = (state < RANS_L) & mask_k & (current_byte_row >= 0)
-                    ptr = (
-                        compressed_data
-                        + tile_start
-                        + (current_byte_row * TILE_N)
-                        + lane_id
-                    )
+                    # tile_data_base = compressed_data + tile_start + lane_id (precomputed)
+                    ptr = tile_data_base + (current_byte_row * TILE_N)
                     state = tl.where(
                         needs_renorm,
                         (state << 8)
@@ -860,11 +844,11 @@ def fused_rans_matmul_kernel_with_bias(
                     current_byte_row -= tl.where(needs_renorm, 1, 0)
 
             # Matmul (accumulating strictly into the LOCAL accumulator)
-            offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
-            offs_bk = (k_tile_idx * TILE_K + bk_start) + tl.arange(0, BLOCK_K)
+            # offs_m and m_valid are precomputed; reuse k_base and bk_range
+            offs_bk = k_base + bk_range
             x_tile = tl.load(
-                x_ptr + (offs_m[:, None] * stride_am + offs_bk[None, :] * stride_ak),
-                mask=(offs_m[:, None] < M) & (offs_bk[None, :] < K),
+                x_row_ptrs[:, None] + offs_bk[None, :] * stride_ak,
+                mask=m_valid[:, None] & (offs_bk[None, :] < K),
                 other=0.0,
             ).to(tl.bfloat16)
 
@@ -873,7 +857,7 @@ def fused_rans_matmul_kernel_with_bias(
                 x_tile, w_tile, local_acc, out_dtype=tl.float32, allow_tf32=False
             )
 
-        # 3. Add the completed 1024-chunk to the main accumulator.
+        # 3. Add the completed chunk to the main accumulator.
         # This double-cast perfectly emulates cuBLAS atomic summing of Split-K chunks!
         acc += local_acc.to(tl.bfloat16)
 
@@ -881,25 +865,18 @@ def fused_rans_matmul_kernel_with_bias(
     acc_bf16 = acc.to(tl.bfloat16)
 
     if HAS_BIAS:
-        offs_n = pid_n * TILE_N + lane_id
-        # Load bias directly as bfloat16
-        bias_vals = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0).to(
+        # Reuse global_n (= pid_n * TILE_N + lane_id) and precomputed n_valid
+        bias_vals = tl.load(bias_ptr + global_n, mask=n_valid, other=0.0).to(
             tl.bfloat16
         )
+        # Reuse precomputed m_valid instead of recomputing the M boundary check
+        acc_bf16 = tl.where(m_valid[:, None], acc_bf16 + bias_vals[None, :], acc_bf16)
 
-        # Optional: Only add bias to valid M rows to save a few cycles
-        mask_m = (pid_m * TILE_M + tl.arange(0, TILE_M)) < M
-
-        # Add them together in bfloat16 space
-        acc_bf16 = tl.where(mask_m[:, None], acc_bf16 + bias_vals[None, :], acc_bf16)
-
-    # 5. Store
-    out_m = pid_m * TILE_M + tl.arange(0, TILE_M)
-    out_n = pid_n * TILE_N + lane_id
+    # 5. Store (reuse precomputed offs_m, global_n, m_valid, n_valid)
     tl.store(
-        output_ptr + (out_m[:, None] * stride_cm + out_n[None, :] * stride_cn),
+        output_ptr + (offs_m[:, None] * stride_cm + global_n[None, :] * stride_cn),
         acc_bf16,
-        mask=(out_m[:, None] < M) & (out_n[None, :] < N),
+        mask=m_valid[:, None] & n_valid[None, :],
     )
 
 
@@ -920,82 +897,42 @@ def fused_rans_linear_triton(
     out=None,
 ):
     K, N = weight_shape
-    x_2d = x.view(-1, K)
-    M_input, K_input = x_2d.shape
+
+    # Single view; reused for shape check, strides, and kernel argument
+    x_flat = x.view(-1, K)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+    M_input, K_input = x_flat.shape
 
     assert (
         K_input == K
     ), f"Input K dimension ({K_input}) does not match expected K ({K})"
 
-    # TILE_K, TILE_N = 1024, 32
-    TILES_N = (
-        N + tile_n - 1
-    ) // tile_n  # Total number of tiles in the N dimension (global constant)
-    TILES_K = (
-        K + tile_k - 1
-    ) // tile_k  # Total number of tiles in the K dimension (depends on weight K)
-
-    print(f"Input M: {M_input}, K: {K}, N: {N}")
-    print(f"Tile size K: {tile_k}, Tile size N: {tile_n}")
-    print(f"Tiles in K dimension: {TILES_K}")
-    print(f"Tiles in N dimension: {TILES_N}")
-    print(f"Total tiles (K x N): {TILES_K * TILES_N}")
-    print(f"Expected streams (tiles x tile_n): {TILES_K * TILES_N * tile_n}")
+    TILES_N = (N + tile_n - 1) // tile_n
+    TILES_K = (K + tile_k - 1) // tile_k
 
     expected_tiles = TILES_K * TILES_N
-    expected_streams = (
-        expected_tiles * tile_n
-    )  # Each tile corresponds to tile_n streams, each stream decodes tile_k rows
+    expected_streams = expected_tiles * tile_n
 
     if initial_states.numel() != expected_streams:
         raise ValueError(
             f"Initial states count ({initial_states.numel()}) does not match expected ({expected_streams}) based on tiling config."
         )
 
-    # --- AGGRESSIVE LOGGING ---
-    print(f"\n[RANS DEBUG] Starting fused_rans_linear_triton")
-    print(f"  > Logical Shapes: M={M_input}, K={K}, N={N}")
-    print(f"  > Tiling Config: TILE_K={tile_k}, TILE_N={tile_n}, BLOCK_K=32")
-    print(f"  > Calculated Grid: num_tiles_k={TILES_K}, num_tiles_n={TILES_N}")
-    print(f"  > Expected Metadata Elements: {expected_tiles}")
-
-    # Tensor Inspection
-    print(
-        f"  > Tensor 'tile_offsets': shape={tile_offsets.shape}, dtype={tile_offsets.dtype}, device={tile_offsets.device}"
-    )
-    print(
-        f"  > Tensor 'tile_max_lens': shape={tile_max_lens.shape}, dtype={tile_max_lens.dtype}"
-    )
-    print(
-        f"  > Tensor 'initial_states': shape={initial_states.shape}, numel={initial_states.numel()}"
-    )
-    print(f"  > Tensor 'mantissas': shape={mantissas.shape}, numel={mantissas.numel()}")
-    print(f"  > Global N Tiles (Constant): {TILES_N}")
-
-    # Critical Sanity Checks
     if tile_offsets.numel() != expected_tiles:
-        print(
-            f"  !! ERROR: tile_offsets numel ({tile_offsets.numel()}) != expected ({expected_tiles})"
-        )
-        print(
-            f"     This means K-sharding failed in the loader. Kernel will OOB for K > 1024."
+        raise ValueError(
+            f"tile_offsets numel ({tile_offsets.numel()}) != expected ({expected_tiles}). "
+            f"K-sharding may have failed in the loader."
         )
 
     expected_mantissa_size = K * N
     if mantissas.numel() != expected_mantissa_size:
-        print(
-            f"  !! ERROR: mantissa numel ({mantissas.numel()}) != expected ({expected_mantissa_size})"
+        raise ValueError(
+            f"mantissa numel ({mantissas.numel()}) != expected ({expected_mantissa_size})"
         )
-
-    # 2. Preparation
-    x_flat = x.view(-1, K)
-    if not x_flat.is_contiguous():
-        print("  > Warning: x is non-contiguous. Forcing contiguous.")
-        x_flat = x_flat.contiguous()
 
     stride_am = x_flat.stride(0)
     stride_ak = x_flat.stride(1)
-    print(f"  > Strides: stride_am={stride_am}, stride_ak={stride_ak}")
 
     # 3. Output Buffer
     if out is None:
@@ -1006,9 +943,10 @@ def fused_rans_linear_triton(
     # 4. Kernel Grid
     TILE_M = 64
     grid = (triton.cdiv(M_input, TILE_M), triton.cdiv(N, tile_n))
-    print(f"  > Launching Grid: {grid}")
 
     # 5. Launch
+    # num_stages=1: the decode loop is sequentially dependent (each symbol depends on
+    # prior state), so software pipelining across iterations only wastes registers.
     fused_rans_matmul_kernel_with_bias[grid](
         x_flat,
         compressed_data,
@@ -1037,11 +975,10 @@ def fused_rans_linear_triton(
         PROB_MASK=4095,
         RANS_L=1 << 16,
         HAS_BIAS=bias is not None,
-        num_stages=2,
+        num_stages=1,
         num_warps=4,
     )
 
-    print(f"[RANS DEBUG] Kernel Finished\n")
     return output.view(*x.shape[:-1], N)
 
 
