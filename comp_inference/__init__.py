@@ -48,3 +48,7 @@ from .transposed_linear_triton import (
 from .embedding_triton import (
     fused_rans_embedding_triton,
 )
+
+from .triton_gemm import (
+    triton_matmul,
+)
