@@ -49,7 +49,6 @@ def rans_decompress_tiled_kernel_triton_ilp2(
     PROB_MASK: tl.constexpr,
     RANS_L: tl.constexpr,
 ):
-    # 1. Map Coordinates
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     tile_id = pid_k * num_tiles_n + pid_n
@@ -58,7 +57,6 @@ def rans_decompress_tiled_kernel_triton_ilp2(
     global_col = pid_n * TILE_N + lane_id
     n_mask = global_col < total_width
 
-    # 2. ILP2 State Loading (Doubled Streams)
     # Layout: [Stream A0...AN, Stream B0...BN]
     tile_stream_base = tile_id * (TILE_N * 2)
     state_A = tl.load(
@@ -68,7 +66,6 @@ def rans_decompress_tiled_kernel_triton_ilp2(
         initial_states + tile_stream_base + TILE_N + lane_id, mask=n_mask, other=0
     ).to(tl.uint32)
 
-    # 3. Metadata and Bitstream Pointers
     tile_start = tl.load(tile_offsets + tile_id).to(tl.int64)
     tile_depth = tl.load(tile_max_lens + tile_id).to(tl.int64)
 
@@ -83,7 +80,7 @@ def rans_decompress_tiled_kernel_triton_ilp2(
     start_row = pid_k * TILE_K
     HALF_TILE_K = TILE_K // 2
 
-    # 4. Decoding Loop (ILP2)
+    # Decode
     for i in range(HALF_TILE_K):
         # Calculate Row Indices for Top and Bottom halves
         row_idx_A = start_row + i
@@ -92,25 +89,21 @@ def rans_decompress_tiled_kernel_triton_ilp2(
         mask_A = n_mask & (row_idx_A < total_height)
         mask_B = n_mask & (row_idx_B < total_height)
 
-        # --- DECODE PHASE ---
         slot_A = state_A & PROB_MASK
         slot_B = state_B & PROB_MASK
 
         sym_A = tl.load(slot_map + slot_A, mask=mask_A, other=0)
         sym_B = tl.load(slot_map + slot_B, mask=mask_B, other=0)
 
-        # --- STORE PHASE ---
         tl.store(output + row_idx_A * total_width + global_col, sym_A, mask=mask_A)
         tl.store(output + row_idx_B * total_width + global_col, sym_B, mask=mask_B)
 
-        # --- STATE UPDATE PHASE ---
         pk_A = tl.load(tables + sym_A.to(tl.int32), mask=mask_A, other=0)
         pk_B = tl.load(tables + sym_B.to(tl.int32), mask=mask_B, other=0)
 
         state_A = (pk_A & 0xFFFF) * (state_A >> PROB_BITS) + (slot_A - (pk_A >> 16))
         state_B = (pk_B & 0xFFFF) * (state_B >> PROB_BITS) + (slot_B - (pk_B >> 16))
 
-        # --- RENORMALIZATION PHASE (A) ---
         for _ in range(2):
             renorm_A = (state_A < RANS_L) & mask_A & (current_byte_row_A >= 0)
             ptr_A = tile_data_base_A + (current_byte_row_A * ROW_STRIDE)
@@ -118,7 +111,6 @@ def rans_decompress_tiled_kernel_triton_ilp2(
             state_A = tl.where(renorm_A, (state_A << 8) | val_A, state_A)
             current_byte_row_A -= tl.where(renorm_A, 1, 0)
 
-        # --- RENORMALIZATION PHASE (B) ---
         for _ in range(2):
             renorm_B = (state_B < RANS_L) & mask_B & (current_byte_row_B >= 0)
             ptr_B = tile_data_base_B + (current_byte_row_B * ROW_STRIDE)
@@ -391,6 +383,127 @@ def rans_decomp_triton_tiled2(
         num_tiles_n=num_tiles_n,
         total_height=output_shape[0],
         total_width=output_shape[1],
+        TILE_K=tile_k,
+        TILE_N=tile_n,
+        PROB_BITS=12,
+        PROB_MASK=4095,
+        RANS_L=1 << 16,
+        num_stages=1,
+        num_warps=4,
+    )
+
+    return output
+
+
+@triton.jit
+def rans_decompress_tiled_kernel_triton(
+    compressed_data,
+    tile_offsets,
+    tile_max_lens,
+    initial_states,
+    output,
+    slot_map,
+    tables,
+    num_tiles_n,
+    total_height,
+    total_width,
+    TILE_K: tl.constexpr,
+    TILE_N: tl.constexpr,
+    PROB_BITS: tl.constexpr,
+    PROB_MASK: tl.constexpr,
+    RANS_L: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    tile_id = pid_k * num_tiles_n + pid_n
+
+    lane_id = tl.arange(0, TILE_N)
+    global_col = pid_n * TILE_N + lane_id
+    n_mask = global_col < total_width
+
+    # Layout: [Stream 0...N] per tile (1 state per lane)
+    tile_stream_base = tile_id * TILE_N
+    state = tl.load(
+        initial_states + tile_stream_base + lane_id, mask=n_mask, other=0
+    ).to(tl.uint32)
+
+    tile_start = tl.load(tile_offsets + tile_id).to(tl.int64)
+    tile_depth = tl.load(tile_max_lens + tile_id).to(tl.int64)
+
+    current_byte_row = tl.full((TILE_N,), tile_depth - 1, dtype=tl.int64)
+
+    # Bitstream Stride is exactly 1x Tile Width
+    ROW_STRIDE = TILE_N
+    tile_data_base = compressed_data + tile_start + lane_id
+
+    start_row = pid_k * TILE_K
+
+    # Decode Full Tile Height sequentially
+    for i in range(TILE_K):
+        # Calculate Row Index
+        row_idx = start_row + i
+        mask = n_mask & (row_idx < total_height)
+
+        slot = state & PROB_MASK
+        sym = tl.load(slot_map + slot, mask=mask, other=0)
+
+        tl.store(output + row_idx * total_width + global_col, sym, mask=mask)
+
+        pk = tl.load(tables + sym.to(tl.int32), mask=mask, other=0)
+        state = (pk & 0xFFFF) * (state >> PROB_BITS) + (slot - (pk >> 16))
+
+        # Renormalization unrolled exactly twice for 8-bit symbols
+        for _ in range(2):
+            renorm = (state < RANS_L) & mask & (current_byte_row >= 0)
+
+            # Note: Using tl.maximum(current_byte_row, 0) avoids out-of-bounds pointer calc
+            # even when masked out, preventing illegal memory access faults on some architectures
+            ptr = tile_data_base + (tl.maximum(current_byte_row, 0) * ROW_STRIDE)
+            val = tl.load(ptr, mask=renorm, other=0).to(tl.uint32)
+
+            state = tl.where(renorm, (state << 8) | val, state)
+            current_byte_row -= tl.where(renorm, 1, 0)
+
+
+def rans_decomp_triton_tiled_splitk(
+    compressed_streams,
+    initial_states,
+    tables,
+    slot_map,
+    output_shape,
+    tile_offsets,
+    tile_max_lens,
+    tile_k=1024,
+    tile_n=32,
+):
+    output = torch.empty(
+        output_shape, device=compressed_streams.device, dtype=torch.uint8
+    )
+
+    K, N = output_shape
+    num_tiles_n = (N + tile_n - 1) // tile_n
+    num_tiles_k = (K + tile_k - 1) // tile_k
+
+    # Validate standard state count (Removed * 2)
+    expected_streams = (num_tiles_n * num_tiles_k) * tile_n
+    if initial_states.numel() != expected_streams:
+        raise ValueError(
+            f"Initial states size mismatch. Expected {expected_streams}, got {initial_states.numel()}"
+        )
+
+    grid = (num_tiles_n, num_tiles_k)
+
+    rans_decompress_tiled_kernel_triton[grid](
+        compressed_data=compressed_streams,
+        tile_offsets=tile_offsets,
+        tile_max_lens=tile_max_lens,
+        initial_states=initial_states,
+        output=output,
+        slot_map=slot_map,
+        tables=tables,
+        num_tiles_n=num_tiles_n,
+        total_height=K,
+        total_width=N,
         TILE_K=tile_k,
         TILE_N=tile_n,
         PROB_BITS=12,

@@ -266,7 +266,7 @@ PYBIND11_MODULE(ccore, m) {
                                           : 1};
 
                  // Call the C++ manager (The code we refined earlier)
-                 auto res = self.compress_tiled(
+                 auto res = self.compress_tiled_ilp2(
                      data.data_ptr<uint8_t>(), data.numel(),
                      freqs.data_ptr<uint16_t>(), cdf.data_ptr<uint16_t>(),
                      shape, tile_height, tile_width);

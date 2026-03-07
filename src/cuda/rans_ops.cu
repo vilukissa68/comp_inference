@@ -71,11 +71,11 @@ RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
             stream_vec.size()};
 }
 
-RansManager::TiledCompressResult RansManager::compress_tiled(
+RansManager::TiledCompressResult RansManager::compress_tiled_ilp2(
     const uint8_t *data, size_t size, const uint16_t *freqs,
     const uint16_t *cdf, const std::pair<size_t, size_t> shape,
     const uint32_t tile_height, const uint32_t tile_width) {
-    auto gpu_result = rans_compress_tiled_cuda<RansConfig8>(
+    auto gpu_result = rans_compress_tiled_cuda_ilp2<RansConfig8>(
         ws->internal, data, size, freqs, cdf, shape, tile_height, tile_width);
 
     const size_t height = shape.first;
@@ -235,6 +235,187 @@ RansManager::TiledCompressResult RansManager::compress_tiled(
     // std::cout << "Interleaving Success. Final Packed Size: " << stream_len
     //           << " bytes\n"
     //           << std::endl;
+
+    // Check that we have equal amount of offsets and tiles
+    if (tile_offsets.size() != num_tiles_k * num_tiles_n) {
+        std::cerr << "CRITICAL ERROR: Number of tile offsets ("
+                  << tile_offsets.size()
+                  << ") does not match expected number of tiles ("
+                  << num_tiles_k * num_tiles_n
+                  << "). This indicates a logic error in offset calculation."
+                  << std::endl;
+        return {false};
+    }
+
+    std::vector<uint32_t> tables_vec(256);
+    CUDA_CHECK(cudaMemcpy(tables_vec.data(), gpu_result.tables,
+                          256 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    return {gpu_result.success,
+            tiled_stream_vec,
+            states_vec,
+            sizes_vec,
+            tables_vec,
+            gpu_result.slot_to_sym,
+            gpu_result.num_streams,
+            stream_len,
+            tile_offsets,
+            tile_max_lens,
+            num_tiles_k,
+            num_tiles_n,
+            tile_height,
+            tile_width};
+}
+
+RansManager::TiledCompressResult RansManager::compress_tiled(
+    const uint8_t *data, size_t size, const uint16_t *freqs,
+    const uint16_t *cdf, const std::pair<size_t, size_t> shape,
+    const uint32_t tile_height, const uint32_t tile_width) {
+    auto gpu_result = rans_compress_tiled_cuda<RansConfig8>(
+        ws->internal, data, size, freqs, cdf, shape, tile_height, tile_width);
+
+    const size_t height = shape.first;
+    const size_t width = shape.second;
+    // Total number of tiles
+    uint32_t expected_num_tiles_k = (height + tile_height - 1) / tile_height;
+    uint32_t expected_num_tiles_n = (width + tile_width - 1) / tile_width;
+
+    // Standard baseline: 1 stream per tile column
+    uint32_t expected_num_streams =
+        expected_num_tiles_k * expected_num_tiles_n * tile_width;
+
+    if (gpu_result.num_streams != expected_num_streams) {
+        std::cerr << "WARNING: Number of streams (" << gpu_result.num_streams
+                  << ") does not match expected (" << expected_num_streams
+                  << "). This may indicate a GPU kernel issue." << std::endl;
+    }
+
+    // 2. Download metadata
+    std::vector<uint32_t> states_vec(gpu_result.num_streams);
+    std::vector<uint32_t> sizes_vec(gpu_result.num_streams);
+
+    // NOTE: values_encoded_vec is intermediate debug data. Do NOT save this to
+    // safetensors!
+    std::vector<uint32_t> values_encoded_vec(gpu_result.num_streams);
+
+    CUDA_CHECK(cudaMemcpy(states_vec.data(), gpu_result.final_states,
+                          gpu_result.num_streams * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(sizes_vec.data(), gpu_result.output_sizes,
+                          gpu_result.num_streams * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+
+    // Zero-length streams are expected for edge tiles.
+    // We only warn if a stream is zero length AND it is NOT in the final K
+    // tile.
+    for (size_t i = 0; i < sizes_vec.size(); ++i) {
+        if (sizes_vec[i] == 0) {
+            uint32_t streams_per_tile = tile_width;
+            uint32_t global_tile_idx = i / streams_per_tile;
+            // Assuming block mapping is (tile_n, tile_k) based on dim3
+            // grid(num_tiles_n, num_tiles_k)
+            uint32_t tile_k_idx = global_tile_idx / expected_num_tiles_n;
+
+            if (tile_k_idx != expected_num_tiles_k - 1) {
+                std::cerr
+                    << "WARNING: Non-edge Stream " << i
+                    << " has zero length. This indicates a GPU kernel issue."
+                    << std::endl;
+            }
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpy(values_encoded_vec.data(), gpu_result.values_encoded,
+                          gpu_result.num_streams * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+
+    // Check no zero for end state
+    for (size_t i = 0; i < states_vec.size(); ++i) {
+        if (states_vec[i] == 0) {
+            std::cerr
+                << "WARNING: Stream " << i
+                << " has zero end state. This may indicate a GPU kernel issue."
+                << std::endl;
+        }
+    }
+
+    // Check that values encoded matches expected output size
+    uint64_t total_values_encoded = 0;
+    for (size_t i = 0; i < values_encoded_vec.size(); ++i) {
+        total_values_encoded += values_encoded_vec[i];
+    }
+    if (total_values_encoded != size) {
+        std::cerr << "WARNING: Total values encoded (" << total_values_encoded
+                  << ") does not match input size (" << size
+                  << "). This may indicate a GPU kernel issue." << std::endl;
+    }
+
+    // ANALYZE SIZES
+    uint32_t max_len = 0;
+    uint32_t zero_count = 0;
+    uint64_t total_compressed_bytes = 0;
+    for (uint32_t sz : sizes_vec) {
+        if (sz == 0)
+            zero_count++;
+        if (sz > max_len)
+            max_len = sz;
+        total_compressed_bytes += sz;
+    }
+
+    size_t trimmed_size = (size_t)max_len * gpu_result.num_streams;
+    std::vector<uint8_t> raw_gpu_data(trimmed_size);
+    CUDA_CHECK(cudaMemcpy(raw_gpu_data.data(), gpu_result.stream, trimmed_size,
+                          cudaMemcpyDeviceToHost));
+
+    uint32_t num_tiles_k = (height + tile_height - 1) / tile_height;
+    uint32_t num_tiles_n = (width + tile_width - 1) / tile_width;
+
+    std::vector<uint8_t> tiled_stream_vec;
+    std::vector<uint32_t> tile_offsets;
+    std::vector<uint32_t> tile_max_lens(num_tiles_k * num_tiles_n, 0);
+
+    uint32_t streams_per_tile = tile_width;
+    for (uint32_t tk = 0; tk < num_tiles_k; ++tk) {
+        for (uint32_t tn = 0; tn < num_tiles_n; ++tn) {
+            uint32_t tile_id = tk * num_tiles_n + tn;
+            tile_offsets.push_back((uint32_t)tiled_stream_vec.size());
+
+            uint32_t local_max_len = 0;
+            uint32_t tile_base_sid = tile_id * streams_per_tile;
+
+            // 1. Find the deepest stream in the tile
+            for (uint32_t s = 0; s < streams_per_tile; ++s) {
+                uint32_t sid = tile_base_sid + s;
+                if (sid < sizes_vec.size())
+                    local_max_len = std::max(local_max_len, sizes_vec[sid]);
+            }
+
+            tile_max_lens[tile_id] = local_max_len;
+
+            // 2. Interleave the bytes
+            for (uint32_t byte_idx = 0; byte_idx < local_max_len; ++byte_idx) {
+                // Iterate over all streams in this tile
+                for (uint32_t s = 0; s < streams_per_tile; ++s) {
+                    uint32_t sid = tile_base_sid + s;
+                    uint32_t stream_len =
+                        (sid < sizes_vec.size()) ? sizes_vec[sid] : 0;
+
+                    uint32_t padding_prefix = local_max_len - stream_len;
+
+                    if (byte_idx < padding_prefix) {
+                        tiled_stream_vec.push_back(0);
+                    } else {
+                        uint32_t actual_idx = byte_idx - padding_prefix;
+                        size_t src_idx =
+                            (size_t)actual_idx * gpu_result.num_streams + sid;
+                        tiled_stream_vec.push_back(raw_gpu_data[src_idx]);
+                    }
+                }
+            }
+        }
+    }
+
+    size_t stream_len = tiled_stream_vec.size();
 
     // Check that we have equal amount of offsets and tiles
     if (tile_offsets.size() != num_tiles_k * num_tiles_n) {

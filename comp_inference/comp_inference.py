@@ -194,9 +194,6 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     TARGET_SUM = 4096
 
     # Safe normalization avoiding zero frequencies (rANS breaks with freq=0)
-    # We add 1 to everything first to ensure non-zero, then normalize rest
-    # Or simple approach: standard float norm -> floor -> fix zeros -> fix sum
-
     freqs = np.floor(counts / counts.sum() * TARGET_SUM).astype(np.int32)
     freqs[freqs == 0] = 1  # Prevent invalid rANS state
 
@@ -207,14 +204,27 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if diff > 0:
         # Add to most frequent symbol
         freqs[np.argmax(freqs)] += diff
+    # Old non-rank-preserving approach
+    # elif diff < 0:
+    #     # Remove from most frequent symbols
+    #     while diff < 0:
+    #         idx = np.argmax(freqs)
+    #         amount = min(freqs[idx] - 1, abs(diff))  # Keep at least 1
+    #         freqs[idx] -= amount
+    #         diff += amount
     elif diff < 0:
-        # Remove from most frequent symbols (carefully)
+        # Remove from the most frequent symbols 1 unit at a time.
+        # This forces the subtractions to alternate across the top
+        # symbols, perfectly preserving their rank order.
         while diff < 0:
             idx = np.argmax(freqs)
-            amount = min(freqs[idx] - 1, abs(diff))  # Keep at least 1
-            freqs[idx] -= amount
-            diff += amount
+            freqs[idx] -= 1
 
+            assert (
+                freqs[idx] >= 1
+            ), "Frequency for a symbol dropped to zero, which should not happen."
+
+            diff += 1
     assert freqs.sum() == TARGET_SUM
 
     # 4. Compute CDF
