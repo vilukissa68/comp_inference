@@ -22,6 +22,7 @@ from comp_inference import (
     uninterleave_mantissas,
     rans_decomp_triton_tiled,
     fused_rans_embedding_triton,
+    triton_matmul,
 )
 
 WARMUP_RUNS = 100
@@ -140,6 +141,9 @@ def test_module_integration(model_path, tile_height=1024, tile_width=32, batch_s
     def run_baseline():
         return torch.matmul(x, weights_kn)
 
+    def run_triton_baseline():
+        return triton_matmul(x, weights_kn)
+
     def run_fused():
         return fused_rans_linear_triton(
             x=x,
@@ -178,6 +182,7 @@ def test_module_integration(model_path, tile_height=1024, tile_width=32, batch_s
 
     # 5. Correctness Verification
     ms_baseline, out_base = profile_function(run_baseline)
+    ms_triton_baseline, out_triton = profile_function(run_triton_baseline)
     ms_fused, out_fused = profile_function(run_fused)
     ms_unfused, out_unfused = profile_function(run_unfused)
 
@@ -187,18 +192,23 @@ def test_module_integration(model_path, tile_height=1024, tile_width=32, batch_s
     # ms_fused = triton.testing.do_bench(run_fused)
     # ms_unfused = triton.testing.do_bench(run_unfused)
 
+    is_triton_valid = torch.allclose(out_base, out_triton, rtol=1e-2, atol=1e-2)
     is_valid_fused = torch.allclose(out_base, out_fused, rtol=1e-2, atol=1e-2)
     is_valid_unfused = torch.allclose(out_base, out_unfused, rtol=1e-2, atol=1e-2)
+    max_error_triton = torch.max(torch.abs(out_base - out_triton)).item()
     max_error_fused = torch.max(torch.abs(out_base - out_fused)).item()
     max_error_unfused = torch.max(torch.abs(out_base - out_unfused)).item()
 
     return {
         "ratio": compression_ratio,
         "ms_baseline": ms_baseline,
+        "ms_triton_baseline": ms_triton_baseline,
+        "is_triton_valid": is_triton_valid,
         "is_valid_fused": is_valid_fused,
         "is_valid_unfused": is_valid_unfused,
         "ms_fused": ms_fused,
         "ms_unfused": ms_unfused,
+        "max_error_triton": max_error_triton,
         "max_error_fused": max_error_fused,
         "max_error_unfused": max_error_unfused,
         "orig_mb": original_bytes / (1024**2),
@@ -241,10 +251,10 @@ if __name__ == "__main__":
     # Final Academic Markdown Table
     print("\n\n📊 FINAL ABLATION RESULTS")
     print(
-        "| Tile Size (H x W) | Comp. Ratio | Fused Valid | Baseline (ms) | Unfused (ms) | Fused (ms) |"
+        "| Tile Size (H x W) | Comp. Ratio | Fused Valid | Baseline (ms) | Baseline Triton (ms) | Unfused (ms) | Fused (ms) |"
     )
     print(
-        "|-------------------|-------------|-------------|---------------|--------------|------------|"
+        "|-------------------|-------------|-------------|---------------|----------------------|--------------|------------|"
     )
     for r in results:
         valid = (
@@ -253,5 +263,5 @@ if __name__ == "__main__":
             else f"Fail (Max Err: {r['max_error_fused']:.4f})"
         )
         print(
-            f"| {r['H']:^4d} x {r['W']:^4d}     | {r['ratio']:^9.2f}x | {valid:^11s} | {r['ms_baseline']:^13.3f} | {r['ms_unfused']:^12.3f} | {r['ms_fused']:^10.3f} |"
+            f"| {r['H']:^4d} x {r['W']:^4d}     | {r['ratio']:^9.2f}x | {valid:^11s} | {r['ms_baseline']:^13.3f}| {r['ms_triton_baseline']:^13.3f} | {r['ms_unfused']:^12.3f} | {r['ms_fused']:^10.3f} |"
         )
