@@ -9,13 +9,27 @@ from safetensors.torch import save_file
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from safetensors.torch import safe_open
 
+import os
+import re
+import torch
+from safetensors.torch import save_file
+from transformers import PreTrainedModel, PreTrainedTokenizer
+
 
 def save_rans_model_package(
-    model: PreTrainedModel, tokenizer: PreTrainedTokenizer, output_dir: str
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    output_dir: str,
+    fuse: bool = False,
+    tied_lm_head: bool = False,
 ):
     """
     Saves the full model package: config.json, tokenizer files, and the compressed safetensors.
+    :param fuse: If True, maps Q/K/V and Gate/Up projections into fused keys for vLLM.
+                 If False, keeps them separate for standard PyTorch/HuggingFace loading.
     """
+    if not fuse:
+        output_dir = output_dir + "_unfused"
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Setup rANS quantization config in model config
@@ -24,8 +38,12 @@ def save_rans_model_package(
 
     layer_configs = {}
     for name, module in model.named_modules():
+        # Ensure that lm_head is not saved
+        if tied_lm_head and "lm_head" in name:
+            print(f"Skipping tied lm_head layer: {name}")
+            continue
+
         if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
-            # Extract the specific tile dimensions for this tensor
             th = getattr(
                 module, "exponent_tile_height", getattr(module, "tile_height", 1024)
             )
@@ -33,12 +51,18 @@ def save_rans_model_package(
                 module, "exponent_tile_width", getattr(module, "tile_width", 32)
             )
 
-            if "gate_proj" in name:
-                name = name.replace("gate_proj", "gate_up_proj")
-            elif "q_proj" in name:
-                name = name.replace("q_proj", "qkv_proj")
+            # Conditionally map names for vLLM vs PyTorch
+            if fuse:
+                if "gate_proj" in name:
+                    name = name.replace("gate_proj", "gate_up_proj")
+                elif "q_proj" in name:
+                    name = name.replace("q_proj", "qkv_proj")
 
-            # Name will be exactly as it appears in the model structure
+                # If fuse is True, the compression script likely deleted k/v/up proj.
+                # If they still exist in the module dict as ghosts, skip adding duplicate configs.
+                if "k_proj" in name or "v_proj" in name or "up_proj" in name:
+                    continue
+
             layer_configs[name] = {"tile_height": th, "tile_width": tw}
 
     # Inject the dictionary into the quantization config
@@ -47,6 +71,9 @@ def save_rans_model_package(
     model.config.quantization_config["layer_configs"] = layer_configs
     model.config.quantization_config["default_tile_height"] = 1024
     model.config.quantization_config["default_tile_width"] = 32
+
+    # Save the fuse status so the runtime loader knows what to expect!
+    model.config.quantization_config["fused_projections"] = fuse
 
     # 2. Save Config & Tokenizer
     print(f"Saving config and tokenizer to {output_dir}...")
@@ -57,61 +84,247 @@ def save_rans_model_package(
 
     # 3. Save Compressed Weights
     safetensors_path = os.path.join(output_dir, "model.safetensors")
-    pack_and_save_tensors(model, safetensors_path)
+    pack_and_save_tensors(model, safetensors_path, fuse=fuse, tied_lm_head=tied_lm_head)
 
 
-def pack_and_save_tensors(model, output_path: str):
+# def pack_and_save_tensors(
+#     model, output_path: str, fuse: bool = False, tied_lm_head: bool = False
+# ):
+#     tensors = {}
+#     print(f"Packing model to {output_path} (Fused Mode: {fuse})...")
+
+#     handled_params = set()
+#     layer_pattern = re.compile(r"layers\.(\d+)\.")
+
+#     for name, module in model.named_modules():
+#         if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
+#             # Conditionally map the safetensor key prefixes
+#             mapped_name = name
+#             if fuse:
+#                 if "gate_proj" in mapped_name:
+#                     mapped_name = mapped_name.replace("gate_proj", "gate_up_proj")
+#                 elif "q_proj" in mapped_name:
+#                     mapped_name = mapped_name.replace("q_proj", "qkv_proj")
+#                 elif (
+#                     "k_proj" in mapped_name
+#                     or "v_proj" in mapped_name
+#                     or "up_proj" in mapped_name
+#                 ):
+#                     # Skip redundant saves if the compression script already fused the tensor into Q/Gate
+#                     handled_params.add(f"{name}.weight")
+#                     if hasattr(module, "bias") and module.bias is not None:
+#                         handled_params.add(f"{name}.bias")
+#                     continue
+
+#             match = layer_pattern.search(mapped_name)
+#             if not match:
+#                 print(
+#                     f"Note: Compressed module {mapped_name} outside standard layer structure."
+#                 )
+#                 vllm_module_name = mapped_name + "."
+#                 prefix = ""
+#             else:
+#                 vllm_module_name = mapped_name + "."
+#                 prefix = ""
+
+#             # 3. Save Compressed Tensors
+#             _save_rans_attributes(tensors, vllm_module_name, prefix, module)
+
+#             # 4. Mark original parameters as Handled
+#             handled_params.add(f"{name}.weight")
+#             if hasattr(module, "bias") and module.bias is not None:
+#                 handled_params.add(f"{name}.bias")
+
+#     # Iterate over ALL parameters in the model.
+#     for param_name, param in model.named_parameters():
+#         if param_name in handled_params:
+#             continue
+#         tensors[param_name] = param.data.cpu()
+
+#     # Metadata
+#     metadata = {
+#         "format": "pt",
+#         "compression_method": "rans_bfloat16",
+#         "fused_projections": str(fuse),
+#     }
+
+#     save_file(tensors, output_path, metadata=metadata)
+#     print(f"Saved {len(tensors)} tensors.")
+
+
+def pack_and_save_tensors(
+    model, output_path: str, fuse: bool = False, tied_lm_head: bool = False
+):
     tensors = {}
-    print(f"Packing model to {output_path}...")
+    print(f"Packing model to {output_path} (Fused Mode: {fuse})...")
 
-    # Keep track of which parameters we have successfully compressed/saved
     handled_params = set()
-
-    # Regex to find layer index (e.g. "layers.0.")
     layer_pattern = re.compile(r"layers\.(\d+)\.")
+
+    if tied_lm_head:
+        print(
+            "Tied LM Head detected: Explicitly dropping lm_head.weight from safetensors."
+        )
+        handled_params.add("lm_head.weight")
+        handled_params.add("model.lm_head.weight")  # Add both common naming conventions
 
     for name, module in model.named_modules():
         if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
-            # 1. Identify Layer Index
+            # mapped_name = name
+            # if fuse:
+            #     if "gate_proj" in mapped_name:
+            #         mapped_name = mapped_name.replace("gate_proj", "gate_up_proj")
+            #     elif "q_proj" in mapped_name:
+            #         mapped_name = mapped_name.replace("q_proj", "qkv_proj")
+            #     elif (
+            #         "k_proj" in mapped_name
+            #         or "v_proj" in mapped_name
+            #         or "up_proj" in mapped_name
+            #     ):
+            #         # Skip redundant saves if the compression script already fused the tensor into Q/Gate
+            #         handled_params.add(f"{name}.weight")
+            #         if hasattr(module, "bias") and module.bias is not None:
+            #             handled_params.add(f"{name}.bias")
+            #         continue
+
             match = layer_pattern.search(name)
             if not match:
-                # This handles edge cases if you compressed lm_head or something outside layers
                 print(
                     f"Note: Compressed module {name} outside standard layer structure."
                 )
                 vllm_module_name = name + "."
                 prefix = ""
             else:
-                layer_idx = match.group(1)
-
-                vllm_module_name = None
-                prefix = ""
-
                 vllm_module_name = name + "."
+                prefix = ""
 
             # 3. Save Compressed Tensors
             _save_rans_attributes(tensors, vllm_module_name, prefix, module)
 
             # 4. Mark original parameters as Handled
-            # The standard parameter name is usually "{module_name}.weight"
             handled_params.add(f"{name}.weight")
-
             if hasattr(module, "bias") and module.bias is not None:
                 handled_params.add(f"{name}.bias")
 
     # Iterate over ALL parameters in the model.
-    # If we didn't compress it in Pass 1, save it raw here.
     for param_name, param in model.named_parameters():
         if param_name in handled_params:
             continue
-
         tensors[param_name] = param.data.cpu()
 
     # Metadata
-    metadata = {"format": "pt", "compression_method": "rans_bfloat16"}
+    metadata = {
+        "format": "pt",
+        "compression_method": "rans_bfloat16",
+        "fused_projections": str(fuse),
+    }
 
     save_file(tensors, output_path, metadata=metadata)
     print(f"Saved {len(tensors)} tensors.")
+
+
+# def save_rans_model_package(
+#     model: PreTrainedModel, tokenizer: PreTrainedTokenizer, output_dir: str
+# ):
+#     """
+#     Saves the full model package: config.json, tokenizer files, and the compressed safetensors.
+#     """
+#     os.makedirs(output_dir, exist_ok=True)
+
+#     # 1. Setup rANS quantization config in model config
+#     if not hasattr(model.config, "quantization_config"):
+#         model.config.quantization_config = {}
+
+#     layer_configs = {}
+#     for name, module in model.named_modules():
+#         if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
+#             # Extract the specific tile dimensions for this tensor
+#             th = getattr(
+#                 module, "exponent_tile_height", getattr(module, "tile_height", 1024)
+#             )
+#             tw = getattr(
+#                 module, "exponent_tile_width", getattr(module, "tile_width", 32)
+#             )
+
+#             if "gate_proj" in name:
+#                 name = name.replace("gate_proj", "gate_up_proj")
+#             elif "q_proj" in name:
+#                 name = name.replace("q_proj", "qkv_proj")
+
+#             # Name will be exactly as it appears in the model structure
+#             layer_configs[name] = {"tile_height": th, "tile_width": tw}
+
+#     # Inject the dictionary into the quantization config
+#     model.config.quantization_config["quant_method"] = "rans"
+#     model.config.quantization_config["compression"] = "rans_bfloat16"
+#     model.config.quantization_config["layer_configs"] = layer_configs
+#     model.config.quantization_config["default_tile_height"] = 1024
+#     model.config.quantization_config["default_tile_width"] = 32
+
+#     # 2. Save Config & Tokenizer
+#     print(f"Saving config and tokenizer to {output_dir}...")
+#     model.config.save_pretrained(output_dir)
+
+#     if tokenizer:
+#         tokenizer.save_pretrained(output_dir)
+
+#     # 3. Save Compressed Weights
+#     safetensors_path = os.path.join(output_dir, "model.safetensors")
+#     pack_and_save_tensors(model, safetensors_path)
+
+
+# def pack_and_save_tensors(model, output_path: str):
+#     tensors = {}
+#     print(f"Packing model to {output_path}...")
+
+#     # Keep track of which parameters we have successfully compressed/saved
+#     handled_params = set()
+
+#     # Regex to find layer index (e.g. "layers.0.")
+#     layer_pattern = re.compile(r"layers\.(\d+)\.")
+
+#     for name, module in model.named_modules():
+#         if hasattr(module, "compressed") and module.compressed == "rans_bfloat16":
+#             # 1. Identify Layer Index
+#             match = layer_pattern.search(name)
+#             if not match:
+#                 # This handles edge cases if you compressed lm_head or something outside layers
+#                 print(
+#                     f"Note: Compressed module {name} outside standard layer structure."
+#                 )
+#                 vllm_module_name = name + "."
+#                 prefix = ""
+#             else:
+#                 layer_idx = match.group(1)
+
+#                 vllm_module_name = None
+#                 prefix = ""
+
+#                 vllm_module_name = name + "."
+
+#             # 3. Save Compressed Tensors
+#             _save_rans_attributes(tensors, vllm_module_name, prefix, module)
+
+#             # 4. Mark original parameters as Handled
+#             # The standard parameter name is usually "{module_name}.weight"
+#             handled_params.add(f"{name}.weight")
+
+#             if hasattr(module, "bias") and module.bias is not None:
+#                 handled_params.add(f"{name}.bias")
+
+#     # Iterate over ALL parameters in the model.
+#     # If we didn't compress it in Pass 1, save it raw here.
+#     for param_name, param in model.named_parameters():
+#         if param_name in handled_params:
+#             continue
+
+#         tensors[param_name] = param.data.cpu()
+
+#     # Metadata
+#     metadata = {"format": "pt", "compression_method": "rans_bfloat16"}
+
+#     save_file(tensors, output_path, metadata=metadata)
+#     print(f"Saved {len(tensors)} tensors.")
 
 
 def _save_rans_attributes(tensors, base_name, prefix, module):

@@ -35,6 +35,12 @@ def main():
         "--tile_height", type=int, default=1024, help="rANS tile height"
     )
     parser.add_argument("--tile_width", type=int, default=32, help="rANS tile width")
+    parser.add_argument(
+        "--no_transpose",
+        action="store_true",
+        default=False,
+        help="Tranpose standard linear layers",
+    )
 
     args = parser.parse_args()
 
@@ -60,6 +66,28 @@ def main():
     # 2. Compress & Decompress Loop
     print("Starting Round-Trip (Compress -> Decompress)...")
 
+    # Detect tied head
+    tied_lm_head = False
+
+    # Check if the config explicitly declares it, or if the tensors match exactly
+    if getattr(model.config, "tie_word_embeddings", False):
+        tied_lm_head = True
+    else:
+        try:
+            in_emb = model.get_input_embeddings().weight
+            out_emb = model.get_output_embeddings().weight
+            # Check if they share the exact same memory address or exact values
+            if in_emb is out_emb or torch.equal(in_emb, out_emb):
+                tied_lm_head = True
+        except Exception:
+            print(
+                "Could not verify tied weights, but it may still be present. Proceeding with compression. If you see unexpected errors, try enabling --skip_embedding."
+            )
+            pass
+
+    if tied_lm_head:
+        print("Detected tied weights! lm_head is identical to embed_tokens.")
+
     compressed_count = 0
     total_params = 0
     layers_compressed = 0
@@ -67,14 +95,23 @@ def main():
     for name, module in model.named_modules():
         print("-" * 80)
         print(f"Processing module: {name} ({type(module)})")
+
+        # Skip embedding/lm_head if requested
         if (
-            name == "model.embed_tokens" or name == "model.lm_head" or name == "lm_head"
-        ) and args.skip_embedding:
+            name in ["model.embed_tokens", "model.lm_head", "lm_head"]
+            and args.skip_embedding
+        ):
             print("Skipping compressing embedding layer.")
             continue
 
-        # Embedding and lm head, shouldn't be transposed
-        if name == "model.embed_tokens" or name == "model.lm_head" or name == "lm_head":
+        # Skip tied lm_head
+        if name in ["model.lm_head", "lm_head"] and tied_lm_head:
+            print(f"Skipping {name} compression (weights are tied to embed_tokens).")
+            # if hasattr(module, "weight"):
+            #     del module.weight
+            continue
+
+        if name in ["model.embed_tokens", "model.lm_head", "lm_head"]:
             print(f"Compressing embedding/lm_head layer: {name}")
             rans_compress_module_weight(
                 module,
@@ -120,20 +157,22 @@ def main():
                 continue
 
             rans_compress_module_weight(
-                module, tile_height=args.tile_height, tile_width=args.tile_width
+                module,
+                tile_height=args.tile_height,
+                tile_width=args.tile_width,
+                transpose_weight=not args.no_transpose,
             )
             layers_compressed += 1
             if not hasattr(module, "compressed"):
                 print(f"Warning: Compression failed for {name}")
     print("Compression phase completed.")
-    pack_and_save_tensors(model, "compressed_model.safetensors")
+    fuse = args.fuse_qkv or args.fuse_gate_up
+    # pack_and_save_tensors(model, "compressed_model.safetensors", fuse=fuse)
 
     model_name_clean = model_name.replace("/", "_")
-    save_rans_model_package(model, tokenizer, model_name_clean)
-    print(
-        "Model compressed and saved to disk. You can now run the decompression and verification steps separately if desired."
+    save_rans_model_package(
+        model, tokenizer, model_name_clean, fuse=fuse, tied_lm_head=tied_lm_head
     )
-    exit(0)
     save_rans_model_gguf(model, tokenizer, "compressed_model.gguf", model_name)
     del model  # Free memory
 

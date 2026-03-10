@@ -52,3 +52,5 @@ from .embedding_triton import (
 from .triton_gemm import (
     triton_matmul,
 )
+
+from .pytorch_runtime import load_compressed_model_with_auto_model

@@ -344,25 +344,8 @@ def rans_compress_module_weight_bf16(
     if transpose_weight:
         module.weight = nn.Parameter(module.weight.t().contiguous())
 
-    # # --- DUMP AND DIE (Compression Side) ---
-    # print(f"\n[DUMP] Capturing ground truth weight. Shape: {module.weight.shape}")
-
-    # # Save the physical bytes exactly as the compressor will see them
-    # torch.save(
-    #     {
-    #         "weight_kn": module.weight.detach().cpu(),
-    #         "shape": module.weight.shape,
-    #     },
-    #     "compression_truth.pt",
-    # )
-
-    # print("Ground truth saved to compression_truth.pt. Exiting.")
-    # exit(0)
-
     print("Weight to compress:", module.weight)
 
-    # 1. Save original metadata needed for reconstruction
-    # We save this BEFORE deleting the weight
     print(
         f"Compressing weight with shape {module.weight.shape} and dtype {module.weight.dtype}"
     )
@@ -405,11 +388,9 @@ def rans_compress_module_weight_bf16(
         module.exponent_tile_width = tile_width
 
     else:
-        # Fallback: Store raw
         module.exponent_raw = exponent
         print("Exponent compression failed. Storing raw.")
 
-    # --- MANTISSA COMPRESSION ---
     mantissa_compression = None
     if not skip_mantissa:
         mantissa_memory_manager = ccore.RansManager(bytes_to_allocate)
@@ -428,12 +409,6 @@ def rans_compress_module_weight_bf16(
         module.mantissa_tables = mantissa_compression.tables
         module.mantissa_slot_map = mantissa_compression.slot_map
     else:
-        # Fallback: Store raw
-        # If skip_mantissa=True, we end up here too.
-        # module.mantissa_raw = mantissa
-
-        # Store mantissa in the interleaved format for potential future use in tiled decompression, even if compression failed or skipped
-        # N, K = mantissa.shape
         K, N = module.weight.shape
         mantissa = mantissa.contiguous()
         print("Mantissa shape before interleaving:", mantissa.shape)
@@ -471,7 +446,6 @@ def rans_compress_module_weight_bf16(
         ), "Interleaved mantissa is the same as original, which should not happen."
 
         module.mantissa_raw = mantissa_interleaved.contiguous()
-        # module.mantissa_raw = mantissa
 
     # Cleanup
     module.compressed = "rans_bfloat16"
