@@ -373,7 +373,11 @@ def rans_compress_module_weight_bf16(
     )
     torch.cuda.current_stream().synchronize()
 
+    # Update tile height and width
     if exponent_compression.success:
+        tile_height = exponent_compression.tile_height
+        tile_width = exponent_compression.tile_width
+
         module.exponent_compressed_weight = exponent_compression.stream
         module.exponent_states = exponent_compression.states
         module.exponent_output_sizes = exponent_compression.output_sizes
@@ -384,8 +388,8 @@ def rans_compress_module_weight_bf16(
         module.exponent_tile_max_lens = exponent_compression.tile_max_lens
         module.exponent_num_tiles_n = exponent_compression.num_tiles_n
         module.exponent_num_tiles_k = exponent_compression.num_tiles_k
-        module.exponent_tile_height = tile_height
-        module.exponent_tile_width = tile_width
+        module.exponent_tile_height = exponent_compression.tile_height
+        module.exponent_tile_width = exponent_compression.tile_width
 
     else:
         module.exponent_raw = exponent

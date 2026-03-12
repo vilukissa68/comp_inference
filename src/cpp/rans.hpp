@@ -52,12 +52,12 @@ class RansManager {
     TiledCompressResult
     compress_tiled(const uint8_t *data, size_t size, const uint16_t *freqs,
                    const uint16_t *cdf, const std::pair<size_t, size_t> shape,
-                   const uint32_t tile_height, const uint32_t tile_width);
+                   uint32_t tile_height, uint32_t tile_width);
     TiledCompressResult
     compress_tiled_ilp2(const uint8_t *data, size_t size, const uint16_t *freqs,
                         const uint16_t *cdf,
                         const std::pair<size_t, size_t> shape,
-                        const uint32_t tile_height, const uint32_t tile_width);
+                        uint32_t tile_height, uint32_t tile_width);
     float decompress(const uint8_t *stream, size_t stream_size,
                      const uint32_t *states, const uint32_t *sizes,
                      uint32_t num_streams, size_t output_size,

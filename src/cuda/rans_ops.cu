@@ -71,15 +71,26 @@ RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
             stream_vec.size()};
 }
 
-RansManager::TiledCompressResult RansManager::compress_tiled_ilp2(
-    const uint8_t *data, size_t size, const uint16_t *freqs,
-    const uint16_t *cdf, const std::pair<size_t, size_t> shape,
-    const uint32_t tile_height, const uint32_t tile_width) {
+RansManager::TiledCompressResult
+RansManager::compress_tiled_ilp2(const uint8_t *data, size_t size,
+                                 const uint16_t *freqs, const uint16_t *cdf,
+                                 const std::pair<size_t, size_t> shape,
+                                 uint32_t tile_height, uint32_t tile_width) {
     auto gpu_result = rans_compress_tiled_cuda_ilp2<RansConfig8>(
         ws->internal, data, size, freqs, cdf, shape, tile_height, tile_width);
 
     const size_t height = shape.first;
     const size_t width = shape.second;
+
+    // Check that tile height and width fit within the shape dimensions
+    // If not decrease to the next power of two
+
+    while (tile_height > height)
+        tile_height /= 2;
+
+    while (tile_width > width)
+        tile_width /= 2;
+
     // Total number of tiles
     uint32_t expected_num_tiles_k = (height + tile_height - 1) / tile_height;
     uint32_t expected_num_tiles_n = (width + tile_width - 1) / tile_width;
@@ -267,15 +278,24 @@ RansManager::TiledCompressResult RansManager::compress_tiled_ilp2(
             tile_width};
 }
 
-RansManager::TiledCompressResult RansManager::compress_tiled(
-    const uint8_t *data, size_t size, const uint16_t *freqs,
-    const uint16_t *cdf, const std::pair<size_t, size_t> shape,
-    const uint32_t tile_height, const uint32_t tile_width) {
+RansManager::TiledCompressResult
+RansManager::compress_tiled(const uint8_t *data, size_t size,
+                            const uint16_t *freqs, const uint16_t *cdf,
+                            const std::pair<size_t, size_t> shape,
+                            uint32_t tile_height, uint32_t tile_width) {
     auto gpu_result = rans_compress_tiled_cuda<RansConfig8>(
         ws->internal, data, size, freqs, cdf, shape, tile_height, tile_width);
 
     const size_t height = shape.first;
     const size_t width = shape.second;
+
+    // Check that tile height and width fit within the shape dimensions
+    while (tile_height > height)
+        tile_height /= 2;
+
+    while (tile_width > width)
+        tile_width /= 2;
+
     // Total number of tiles
     uint32_t expected_num_tiles_k = (height + tile_height - 1) / tile_height;
     uint32_t expected_num_tiles_n = (width + tile_width - 1) / tile_width;

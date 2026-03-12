@@ -37,6 +37,8 @@ struct TiledTensorCompressResult {
     torch::Tensor tile_max_lens;
     uint32_t num_tiles_n;
     uint32_t num_tiles_k;
+    uint32_t tile_height;
+    uint32_t tile_width;
 };
 
 PYBIND11_MODULE(ccore, m) {
@@ -143,7 +145,9 @@ PYBIND11_MODULE(ccore, m) {
         .def_readonly("tile_max_lens",
                       &TiledTensorCompressResult::tile_max_lens)
         .def_readonly("num_tiles_n", &TiledTensorCompressResult::num_tiles_n)
-        .def_readonly("num_tiles_k", &TiledTensorCompressResult::num_tiles_k);
+        .def_readonly("num_tiles_k", &TiledTensorCompressResult::num_tiles_k)
+        .def_readonly("tile_height", &TiledTensorCompressResult::tile_height)
+        .def_readonly("tile_width", &TiledTensorCompressResult::tile_width);
 
     py::class_<RansManager::CompressResult>(m, "CompressResult")
         .def_readonly("success", &RansManager::CompressResult::success)
@@ -297,7 +301,9 @@ PYBIND11_MODULE(ccore, m) {
                      to_tensor_u32(res.tile_offsets),
                      to_tensor_u32(res.tile_max_lens),
                      res.num_tiles_n,
-                     res.num_tiles_k};
+                     res.num_tiles_k,
+                     res.tile_height,
+                     res.tile_width};
              })
 
         .def("decompress",

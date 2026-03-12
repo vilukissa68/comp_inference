@@ -954,10 +954,10 @@ def plot_pareto_frontier(results):
 
 if __name__ == "__main__":
     MODEL_PATH = "Qwen/Qwen3-14B"
-    heights = [256, 512, 1024]
+    heights = [256, 512, 1024, 2048, 4096]
     widths = [32, 64, 128, 256]
     BATCH_SIZE = 1
-    NUM_LAYERS = 10
+    NUM_LAYERS = 15
 
     print(f"\nStarting 10-Layer Ablation Study | Batch Size: {BATCH_SIZE}")
     real_weights = get_compressible_layers(MODEL_PATH, num_layers=NUM_LAYERS)
