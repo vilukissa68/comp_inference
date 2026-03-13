@@ -71,6 +71,137 @@ RansManager::compress(const uint8_t *data, size_t size, const uint16_t *freqs,
             stream_vec.size()};
 }
 
+RansManager::UncoalescedTiledCompressResult
+RansManager::compress_tiled_uncoalesced(const uint8_t *data, size_t size,
+                                        const uint16_t *freqs,
+                                        const uint16_t *cdf,
+                                        const std::pair<size_t, size_t> shape,
+                                        uint32_t tile_height,
+                                        uint32_t tile_width) {
+    // Drop ILP2 from kernel call
+    auto gpu_result = rans_compress_tiled_uncoalesced_cuda<RansConfig8>(
+        ws->internal, data, size, freqs, cdf, shape, tile_height, tile_width);
+
+    const size_t height = shape.first;
+    const size_t width = shape.second;
+
+    while (tile_height > height)
+        tile_height /= 2;
+    while (tile_width > width)
+        tile_width /= 2;
+
+    uint32_t expected_num_tiles_k = (height + tile_height - 1) / tile_height;
+    uint32_t expected_num_tiles_n = (width + tile_width - 1) / tile_width;
+
+    // FIX 1: ILP-2 removed, streams are exactly tiles * tile_width
+    uint32_t expected_num_streams =
+        expected_num_tiles_k * expected_num_tiles_n * tile_width;
+
+    if (gpu_result.num_streams != expected_num_streams) {
+        std::cerr << "WARNING: Number of streams (" << gpu_result.num_streams
+                  << ") does not match expected (" << expected_num_streams
+                  << "). This may indicate a GPU kernel issue." << std::endl;
+    }
+
+    std::vector<uint32_t> states_vec(gpu_result.num_streams);
+    std::vector<uint32_t> sizes_vec(gpu_result.num_streams);
+    std::vector<uint32_t> values_encoded_vec(gpu_result.num_streams);
+
+    CUDA_CHECK(cudaMemcpy(states_vec.data(), gpu_result.final_states,
+                          gpu_result.num_streams * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(sizes_vec.data(), gpu_result.output_sizes,
+                          gpu_result.num_streams * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaMemcpy(values_encoded_vec.data(), gpu_result.values_encoded,
+                          gpu_result.num_streams * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+
+    for (size_t i = 0; i < states_vec.size(); ++i) {
+        if (states_vec[i] == 0) {
+            std::cerr
+                << "WARNING: Stream " << i
+                << " has zero end state. This may indicate a GPU kernel issue."
+                << std::endl;
+        }
+    }
+
+    uint64_t total_values_encoded = 0;
+    for (size_t i = 0; i < values_encoded_vec.size(); ++i) {
+        total_values_encoded += values_encoded_vec[i];
+    }
+    if (total_values_encoded != size) {
+        std::cerr << "WARNING: Total values encoded (" << total_values_encoded
+                  << ") does not match input size (" << size
+                  << "). This may indicate a GPU kernel issue." << std::endl;
+    }
+
+    // ANALYZE SIZES
+    uint32_t max_len = 0;
+    uint64_t total_compressed_bytes = 0;
+    for (uint32_t sz : sizes_vec) {
+        if (sz > max_len)
+            max_len = sz;
+        total_compressed_bytes += sz; // Track exactly how many bytes we need
+    }
+
+    size_t trimmed_size = (size_t)max_len * gpu_result.num_streams;
+    std::vector<uint8_t> raw_gpu_data(trimmed_size);
+    CUDA_CHECK(cudaMemcpy(raw_gpu_data.data(), gpu_result.stream, trimmed_size,
+                          cudaMemcpyDeviceToHost));
+
+    uint32_t num_tiles_k = (height + tile_height - 1) / tile_height;
+    uint32_t num_tiles_n = (width + tile_width - 1) / tile_width;
+
+    std::vector<uint8_t> packed_stream_vec;
+    packed_stream_vec.reserve(
+        total_compressed_bytes); // Prevent reallocation overhead
+    std::vector<uint32_t> stream_offsets(gpu_result.num_streams, 0);
+
+    // --- FIX 2: DENSE PACKING ---
+    // Instead of padding streams with zeros to match local_max_len,
+    // we sequentially concatenate exactly the valid bytes from each stream.
+    for (uint32_t sid = 0; sid < gpu_result.num_streams; ++sid) {
+        // Record where this stream begins in the dense array
+        stream_offsets[sid] = (uint32_t)packed_stream_vec.size();
+
+        uint32_t stream_len = sizes_vec[sid];
+
+        // Extract valid bytes from the strided GPU layout
+        for (uint32_t byte_idx = 0; byte_idx < stream_len; ++byte_idx) {
+            size_t src_idx = (size_t)byte_idx * gpu_result.num_streams + sid;
+            packed_stream_vec.push_back(raw_gpu_data[src_idx]);
+        }
+    }
+
+    size_t stream_len = packed_stream_vec.size();
+
+    // Ensure we generated an offset for every stream
+    if (stream_offsets.size() != gpu_result.num_streams) {
+        std::cerr << "CRITICAL ERROR: Offset calculation failed." << std::endl;
+        return {false};
+    }
+
+    std::vector<uint32_t> tables_vec(256);
+    CUDA_CHECK(cudaMemcpy(tables_vec.data(), gpu_result.tables,
+                          256 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    return {gpu_result.success,
+            packed_stream_vec,
+            states_vec,
+            sizes_vec,
+            tables_vec,
+            gpu_result.slot_to_sym,
+            gpu_result.num_streams,
+            stream_len,
+            stream_offsets, // <-- We now return stream_offsets
+            num_tiles_k,
+            num_tiles_n,
+            tile_height,
+            tile_width};
+}
+
 RansManager::TiledCompressResult
 RansManager::compress_tiled_ilp2(const uint8_t *data, size_t size,
                                  const uint16_t *freqs, const uint16_t *cdf,

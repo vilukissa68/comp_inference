@@ -38,15 +38,18 @@ from .rans_triton import (
 
 from .linear_triton import (
     fused_rans_linear_triton,
+    fused_rans_linear_triton_uncoalesced,
 )
 
 
 from .transposed_linear_triton import (
     fused_rans_linear_transposed_triton,
+    fused_rans_linear_transposed_triton_uncoalesced,
 )
 
 from .embedding_triton import (
     fused_rans_embedding_triton,
+    fused_rans_embedding_triton_uncoalesced,
 )
 
 from .triton_gemm import (

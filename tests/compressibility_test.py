@@ -207,7 +207,7 @@ def compress_rans(model, tokenizer, model_name_clean, out_dir):
         skip_embedding = False
         fuse_qkv = True
         fuse_gate_up = True
-        tile_height = 512
+        tile_height = 1024
         tile_width = 128
 
     args = Args()
@@ -687,6 +687,7 @@ def plot_results(results_dict: dict):
 #     # This runs whether we just computed the results or loaded them from disk
 #     plot_results(results)
 
+
 def main(args):
     if args.load_json and os.path.exists(args.load_json):
         print(f"Loading existing results from '{args.load_json}'...")
@@ -696,7 +697,7 @@ def main(args):
 
     else:
         results = {}
-        
+
         # Helper function to prevent re-running completed compressions
         def is_compressed(path):
             return os.path.exists(path) and len(os.listdir(path)) > 0
@@ -719,12 +720,14 @@ def main(args):
             model = AutoModelForCausalLM.from_pretrained(
                 model_id, dtype=torch.bfloat16, low_cpu_mem_usage=True
             )
-            
+
             if not is_compressed(paths["Baseline (BF16)"]):
                 model.save_pretrained(paths["Baseline (BF16)"], safe_serialization=True)
             else:
                 print("  -> Skipping Baseline (BF16): Already exists on disk.")
-            results[model_id]["Baseline (BF16)"] = get_dir_size_gb(paths["Baseline (BF16)"])
+            results[model_id]["Baseline (BF16)"] = get_dir_size_gb(
+                paths["Baseline (BF16)"]
+            )
 
             if not is_compressed(paths["FP8*"]):
                 compress_llmcompressor_fp8(model_id, paths["FP8*"])
@@ -760,6 +763,7 @@ def main(args):
         print("\nRaw results saved to compression_results.json")
 
     plot_results(results)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run LLM compressibility benchmarks.")

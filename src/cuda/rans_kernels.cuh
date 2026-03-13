@@ -6,6 +6,75 @@
 
 template <typename RansConfig>
 __global__ void
+rans_compress_kernel_tiled_uncoalesced(RansTiledEncoderCtx<RansConfig> ctx) {
+    using symbol_t = typename RansConfig::symbol_t;
+    using state_t = typename RansConfig::state_t;
+    using io_t = typename RansConfig::io_t;
+    using sym_info_t = typename RansConfig::sym_info_t;
+
+    __shared__ sym_info_t s_sym_info[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        s_sym_info[i] = ctx.tables.sym_info[i];
+    }
+    __syncthreads();
+
+    uint32_t tile_idx_n = blockIdx.x;
+    uint32_t tile_idx_k = blockIdx.y;
+
+    // Thread handles ONE entire column (one stream)
+    uint32_t local_col = threadIdx.x;
+    uint32_t global_col = tile_idx_n * ctx.tile_width + local_col;
+
+    if (global_col >= ctx.total_width)
+        return;
+
+    // Every thread produces exactly one stream.
+    uint32_t base_stream_idx =
+        (tile_idx_k * ctx.num_tiles_n + tile_idx_n) * ctx.tile_width;
+    uint32_t global_stream_id = base_stream_idx + local_col;
+
+    state_t state = RansConfig::rans_l;
+    uint32_t out_idx = 0;
+    uint32_t values_encoded = 0;
+
+    uint32_t start_row = tile_idx_k * ctx.tile_height;
+    const state_t x_max_base =
+        ((RansConfig::rans_l >> RansConfig::prob_bits) << RansConfig::io_bits);
+
+    // Compute
+    for (int i = (int)ctx.tile_height - 1; i >= 0; --i) {
+        uint32_t row = start_row + i;
+        if (row >= ctx.total_height)
+            continue;
+
+        symbol_t sym = ctx.symbols[row * ctx.total_width + global_col];
+        auto info = s_sym_info[sym];
+        state_t x_max = x_max_base * info.freq;
+
+        values_encoded++;
+        while (state >= x_max) {
+            if (out_idx < ctx.stream_capacity) {
+                // Write out coalesced bytes to the temporary buffer
+                ctx.output[out_idx * ctx.num_streams + global_stream_id] =
+                    (io_t)(state & RansConfig::io_mask);
+                out_idx++;
+            } else {
+                ctx.success = false;
+                break;
+            }
+            state >>= RansConfig::io_bits;
+        }
+        state = ((state / info.freq) << RansConfig::prob_bits) +
+                (state % info.freq) + info.cdf;
+    }
+
+    ctx.final_states[global_stream_id] = state;
+    ctx.stream_sizes[global_stream_id] = out_idx;
+    ctx.values_encoded[global_stream_id] = values_encoded;
+}
+
+template <typename RansConfig>
+__global__ void
 rans_compress_kernel_tiled_ilp2(RansTiledEncoderCtx<RansConfig> ctx) {
     using symbol_t = typename RansConfig::symbol_t;
     using state_t = typename RansConfig::state_t;

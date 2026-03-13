@@ -240,7 +240,10 @@ def get_rans_lut(data: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def rans_compress_qkv_fused(
-    self_attn_module: nn.Module, tile_height=1024, tile_width=32
+    self_attn_module: nn.Module,
+    tile_height=1024,
+    tile_width=32,
+    uncoalesced_interleaving=False,
 ):
     """
     Fuse q_proj, k_proj, v_proj into a single qkv_proj and
@@ -272,7 +275,10 @@ def rans_compress_qkv_fused(
         f"Compressing fused QKV with shape {fused_weight.shape} and dtype {fused_weight.dtype}"
     )
     rans_compress_module_weight_bf16(
-        qkv_proj, tile_height=tile_height, tile_width=tile_width
+        qkv_proj,
+        tile_height=tile_height,
+        tile_width=tile_width,
+        uncoalesced_interleaving=uncoalesced_interleaving,
     )
 
     # Attach to attention module
@@ -286,7 +292,12 @@ def rans_compress_qkv_fused(
     del self_attn_module.v_proj
 
 
-def rans_compress_gate_up_fused(ffn_module: nn.Module, tile_height=1024, tile_width=32):
+def rans_compress_gate_up_fused(
+    ffn_module: nn.Module,
+    tile_height=1024,
+    tile_width=32,
+    uncoalesced_interleaving=False,
+):
     """
     Fuse gate_proj and up_proj into a single gate_up_proj and
     compress it using rANS.
@@ -314,7 +325,10 @@ def rans_compress_gate_up_fused(ffn_module: nn.Module, tile_height=1024, tile_wi
         f"Compressing fused Gate+Up with shape {fused_weight.shape} and dtype {fused_weight.dtype}"
     )
     rans_compress_module_weight_bf16(
-        gate_up_proj, tile_height=tile_height, tile_width=tile_width
+        gate_up_proj,
+        tile_height=tile_height,
+        tile_width=tile_width,
+        uncoalesced_interleaving=uncoalesced_interleaving,
     )
 
     # Attach to ffn module
@@ -333,6 +347,7 @@ def rans_compress_module_weight_bf16(
     tile_height=1024,
     tile_width=32,
     transpose_weight=True,
+    uncoalesced_interleaving=False,
 ) -> None:
     if not hasattr(module, "weight"):
         return
@@ -364,14 +379,23 @@ def rans_compress_module_weight_bf16(
     exp_memory_manager = ccore.RansManager(bytes_to_allocate)
 
     # --- EXPONENT COMPRESSION ---
-    exponent_compression = exp_memory_manager.compress_tiled(
-        exponent,
-        module.exponent_freqs.contiguous(),
-        module.exponent_cdf.contiguous(),  # Tensor (uint8)
-        tile_height,
-        tile_width,
-    )
-    torch.cuda.current_stream().synchronize()
+    if uncoalesced_interleaving:
+        exponent_compression = exp_memory_manager.compress_tiled_uncoalesced(
+            exponent,
+            module.exponent_freqs.contiguous(),
+            module.exponent_cdf.contiguous(),  # Tensor (uint8)
+            tile_height,
+            tile_width,
+        )
+    else:
+        exponent_compression = exp_memory_manager.compress_tiled(
+            exponent,
+            module.exponent_freqs.contiguous(),
+            module.exponent_cdf.contiguous(),  # Tensor (uint8)
+            tile_height,
+            tile_width,
+        )
+        torch.cuda.current_stream().synchronize()
 
     # Update tile height and width
     if exponent_compression.success:
@@ -384,12 +408,18 @@ def rans_compress_module_weight_bf16(
         module.exponent_num_streams = exponent_compression.num_streams
         module.exponent_tables = exponent_compression.tables
         module.exponent_slot_map = exponent_compression.slot_map
-        module.exponent_tile_offsets = exponent_compression.tile_offsets
-        module.exponent_tile_max_lens = exponent_compression.tile_max_lens
         module.exponent_num_tiles_n = exponent_compression.num_tiles_n
         module.exponent_num_tiles_k = exponent_compression.num_tiles_k
         module.exponent_tile_height = exponent_compression.tile_height
         module.exponent_tile_width = exponent_compression.tile_width
+
+        if uncoalesced_interleaving:
+            module.exponent_uncoalesced_interleaving = True
+            module.exponent_stream_offsets = exponent_compression.stream_offsets
+        else:
+            module.exponent_uncoalesced_interleaving = False
+            module.exponent_tile_offsets = exponent_compression.tile_offsets
+            module.exponent_tile_max_lens = exponent_compression.tile_max_lens
 
     else:
         module.exponent_raw = exponent
@@ -516,7 +546,11 @@ def rans_compress_module_weight_int8(module: nn.Module) -> None:
 
 
 def rans_compress_module_weight(
-    module: nn.Module, tile_height=1024, tile_width=32, transpose_weight=True
+    module: nn.Module,
+    tile_height=1024,
+    tile_width=32,
+    transpose_weight=True,
+    uncoalesced_interleaving=False,
 ) -> None:
     if not hasattr(module, "weight"):
         return
@@ -526,6 +560,7 @@ def rans_compress_module_weight(
             tile_height=tile_height,
             tile_width=tile_width,
             transpose_weight=transpose_weight,
+            uncoalesced_interleaving=uncoalesced_interleaving,
         )
     elif module.weight.dtype in [torch.uint8, torch.int8]:
         rans_compress_module_weight_int8(module)

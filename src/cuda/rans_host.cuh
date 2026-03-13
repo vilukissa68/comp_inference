@@ -291,6 +291,136 @@ template <typename Config> struct RansTiledResultPointers {
 };
 
 template <typename Config>
+RansTiledResultPointers<Config> rans_compress_tiled_uncoalesced_cuda(
+    RansWorkspace<Config> &ws, const typename Config::symbol_t *host_data,
+    size_t input_size, const uint16_t *host_freqs, const uint16_t *host_cdf,
+    const std::pair<size_t, size_t> shape, const uint32_t tile_height,
+    const uint32_t tile_width) {
+
+    std::cout << "Starting tiled compression...\n";
+
+    using io_t = typename Config::io_t;
+    using symbol_t = typename Config::symbol_t;
+    using sym_info_t = typename Config::sym_info_t;
+
+    uint32_t K = shape.first;
+    uint32_t N = shape.second;
+
+    // Ensure that tile height is multiple of 16
+    if (tile_height % 16 != 0) {
+        std::cerr << "Tile height must be a multiple of 16 for proper state "
+                     "management.\n";
+        throw std::runtime_error("Invalid tile height");
+    }
+
+    uint32_t num_tiles_k = (K + tile_height - 1) / tile_height;
+    uint32_t num_tiles_n = (N + tile_width - 1) / tile_width;
+    uint32_t total_tiles = num_tiles_k * num_tiles_n;
+
+    // --- THE FIX: Remove the * 2 since we dropped ILP2 ---
+    uint32_t num_streams = total_tiles * tile_width;
+
+    std::cout << "Calculated num tiles K: " << num_tiles_k
+              << ", num tiles N: " << num_tiles_n
+              << ", total tiles: " << total_tiles
+              << ", num streams: " << num_streams
+              << ", tile height: " << tile_height
+              << ", tile width: " << tile_width << "\n";
+
+    // Check that input_size matches total shape
+    if (input_size != K * N) {
+        std::cerr << "Input size (" << input_size
+                  << ") does not match expected size from shape (" << K * N
+                  << ")\n";
+        throw std::runtime_error("Input size mismatch in tiled compression");
+    }
+
+    // We use a fixed capacity per stream for the one-pass workspace
+    size_t syms_per_stream = (input_size + num_streams - 1) / num_streams;
+    uint32_t capacity = (uint32_t)(syms_per_stream * 1.25) + 64;
+
+    ws.resize(K * N * sizeof(symbol_t), num_streams, capacity);
+
+    // Pack tables
+    std::vector<sym_info_t> host_sym_info(Config::vocab_size);
+    for (int i = 0; i < Config::vocab_size; ++i) {
+        host_sym_info[i].freq = host_freqs[i];
+        host_sym_info[i].cdf = host_cdf[i];
+    }
+
+    // Generate slot to symbol map
+    std::vector<symbol_t> host_slot_map(Config::prob_scale);
+    for (int i = 0; i < Config::vocab_size; ++i) {
+        for (int j = 0; j < host_freqs[i]; ++j) {
+            host_slot_map[host_cdf[i] + j] = (symbol_t)i;
+        }
+    }
+
+    cudaStream_t stream = 0;
+
+    // Move tables to GPU
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_sym_info, host_sym_info.data(),
+                               Config::vocab_size * sizeof(sym_info_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    // Move input symbols to GPU
+    CUDA_CHECK(cudaMemcpyAsync(ws.d_symbols, host_data,
+                               input_size * sizeof(symbol_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    // 2. Configure Context
+    RansTiledEncoderCtx<Config> ctx;
+    ctx.success = true;
+    ctx.tile_height = tile_height;
+    ctx.tile_width = tile_width;
+    ctx.num_tiles_k = num_tiles_k;
+    ctx.num_tiles_n = num_tiles_n;
+    ctx.symbols = ws.d_symbols;
+    ctx.total_height = K;
+    ctx.total_width = N;
+    ctx.output = ws.d_output;
+    ctx.final_states = ws.d_states;
+    ctx.stream_sizes = ws.d_sizes;
+    ctx.num_streams = num_streams;
+    ctx.stream_capacity = capacity;
+    ctx.tables.sym_info = ws.d_sym_info;
+    ctx.values_encoded = ws.d_values_encoded;
+
+    std::cout << "Got tile height: " << tile_height
+              << ", tile width: " << tile_width
+              << ", num tiles K: " << num_tiles_k
+              << ", num tiles N: " << num_tiles_n
+              << ", total streams: " << num_streams
+              << ", capacity per stream: " << capacity << "\n";
+
+    // --- THE FIX: Launch the single-pass kernel ---
+    dim3 block(tile_width, 1);           // width, height
+    dim3 grid(num_tiles_n, num_tiles_k); // width, height
+
+    rans_compress_kernel_tiled_uncoalesced<Config>
+        <<<grid, block, 0, stream>>>(ctx);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // --- 5. RETURN TILED RESULT ---
+    return {
+        ctx.success,
+        ws.d_output, // Compressed stream
+        ws.d_states, // Final states
+        ws.d_sizes,  // Length of each stream
+        num_streams, // Number of streams
+        (size_t)num_streams *
+            capacity, // Total allocated stream length in bytes
+        capacity,
+        tile_height,        // Height
+        tile_width,         // Width
+        num_tiles_n,        // Number of tiles across width
+        num_tiles_k,        // Number of tiles across height
+        ws.d_sym_info,      // Symbol info table
+        host_slot_map,      // Slot to symbol map
+        ws.d_values_encoded // Buffer with the actual encoded values
+    };
+}
+template <typename Config>
 RansTiledResultPointers<Config> rans_compress_tiled_cuda_ilp2(
     RansWorkspace<Config> &ws, const typename Config::symbol_t *host_data,
     size_t input_size, const uint16_t *host_freqs, const uint16_t *host_cdf,

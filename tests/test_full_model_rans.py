@@ -41,6 +41,12 @@ def main():
         default=False,
         help="Tranpose standard linear layers",
     )
+    parser.add_argument(
+        "--uncoalesced",
+        action="store_true",
+        default=False,
+        help="Save compressed tensors without padding for better compression ratio",
+    )
 
     args = parser.parse_args()
 
@@ -118,6 +124,7 @@ def main():
                 tile_height=args.tile_height,
                 tile_width=args.tile_width,
                 transpose_weight=False,
+                uncoalesced_interleaving=args.uncoalesced,
             )
             layers_compressed += 1
             continue
@@ -131,7 +138,10 @@ def main():
         ):
             print(f"Fusing QKV for {name}")
             rans_compress_qkv_fused(
-                module, tile_height=args.tile_height, tile_width=args.tile_width
+                module,
+                tile_height=args.tile_height,
+                tile_width=args.tile_width,
+                uncoalesced_interleaving=args.uncoalesced,
             )
             layers_compressed += 1
             continue
@@ -145,7 +155,10 @@ def main():
         ):
             print(f"Fusing gate and up for {name}")
             rans_compress_gate_up_fused(
-                module, tile_height=args.tile_height, tile_width=args.tile_width
+                module,
+                tile_height=args.tile_height,
+                tile_width=args.tile_width,
+                uncoalesced_interleaving=args.uncoalesced,
             )
             layers_compressed += 1
             continue
@@ -161,6 +174,7 @@ def main():
                 tile_height=args.tile_height,
                 tile_width=args.tile_width,
                 transpose_weight=not args.no_transpose,
+                uncoalesced_interleaving=args.uncoalesced,
             )
             layers_compressed += 1
             if not hasattr(module, "compressed"):

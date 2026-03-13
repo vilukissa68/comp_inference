@@ -58,12 +58,34 @@ def save_rans_model_package(
                 elif "q_proj" in name:
                     name = name.replace("q_proj", "qkv_proj")
 
+                uncoalesced = (
+                    module.exponent_uncoalesced_interleaving
+                    if hasattr(module, "exponent_uncoalesced_interleaving")
+                    else False
+                )
+
+                layer_configs[name] = {
+                    "tile_height": th,
+                    "tile_width": tw,
+                    "uncoalesced_interleaving": uncoalesced,
+                }
+
                 # If fuse is True, the compression script likely deleted k/v/up proj.
                 # If they still exist in the module dict as ghosts, skip adding duplicate configs.
                 if "k_proj" in name or "v_proj" in name or "up_proj" in name:
                     continue
 
-            layer_configs[name] = {"tile_height": th, "tile_width": tw}
+            uncoalesced = (
+                module.exponent_uncoalesced_interleaving
+                if hasattr(module, "exponent_uncoalesced_interleaving")
+                else False
+            )
+
+            layer_configs[name] = {
+                "tile_height": th,
+                "tile_width": tw,
+                "uncoalesced_interleaving": uncoalesced,
+            }
 
     # Inject the dictionary into the quantization config
     model.config.quantization_config["quant_method"] = "rans"
@@ -376,15 +398,6 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
             module, "exponent_states", torch.uint32
         )
 
-        # Metadata / Tile Metrics
-        tensors[f"{base_name}{p}rans_exp_tile_offsets"] = _validate_and_get(
-            module, "exponent_tile_offsets", torch.uint32
-        )
-
-        tensors[f"{base_name}{p}rans_exp_tile_max_lens"] = _validate_and_get(
-            module, "exponent_tile_max_lens", torch.uint32
-        )
-
         # Decompression Tables
         tensors[f"{base_name}{p}rans_exp_tables"] = _validate_and_get(
             module, "exponent_tables", torch.uint32
@@ -393,6 +406,22 @@ def _save_rans_attributes(tensors, base_name, prefix, module):
         tensors[f"{base_name}{p}rans_exp_slot_map"] = _validate_and_get(
             module, "exponent_slot_map", torch.uint8
         )
+
+        # Metadata / Tile Metrics
+        # Check for coalesced write
+        if getattr(module, "exponent_uncoalesced_interleaving", False):
+            tensors[f"{base_name}{p}rans_exp_stream_offsets"] = _validate_and_get(
+                module, "exponent_stream_offsets", torch.uint32
+            )
+        else:
+            tensors[f"{base_name}{p}rans_exp_tile_offsets"] = _validate_and_get(
+                module, "exponent_tile_offsets", torch.uint32
+            )
+
+            tensors[f"{base_name}{p}rans_exp_tile_max_lens"] = _validate_and_get(
+                module, "exponent_tile_max_lens", torch.uint32
+            )
+
         is_exp_compressed = 1
     else:
         # Fallback for uncompressed raw exponents

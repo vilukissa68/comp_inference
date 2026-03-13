@@ -41,6 +41,21 @@ struct TiledTensorCompressResult {
     uint32_t tile_width;
 };
 
+struct UncoalescedTiledTensorCompressResult {
+    bool success;
+    torch::Tensor stream;
+    torch::Tensor states;
+    torch::Tensor tables;
+    torch::Tensor slot_map;
+    torch::Tensor output_sizes;
+    uint32_t num_streams;
+    size_t stream_len;
+    torch::Tensor stream_offsets;
+    uint32_t num_tiles_n;
+    uint32_t num_tiles_k;
+    uint32_t tile_height;
+    uint32_t tile_width;
+};
 PYBIND11_MODULE(ccore, m) {
     m.doc() = "Python bindings for CUDA accelerated operations";
     m.def(
@@ -148,6 +163,31 @@ PYBIND11_MODULE(ccore, m) {
         .def_readonly("num_tiles_k", &TiledTensorCompressResult::num_tiles_k)
         .def_readonly("tile_height", &TiledTensorCompressResult::tile_height)
         .def_readonly("tile_width", &TiledTensorCompressResult::tile_width);
+
+    py::class_<UncoalescedTiledTensorCompressResult>(
+        m, "UncoalescedTiledTensorCompressResult")
+        .def_readonly("success", &UncoalescedTiledTensorCompressResult::success)
+        .def_readonly("stream", &UncoalescedTiledTensorCompressResult::stream)
+        .def_readonly("states", &UncoalescedTiledTensorCompressResult::states)
+        .def_readonly("tables", &UncoalescedTiledTensorCompressResult::tables)
+        .def_readonly("slot_map",
+                      &UncoalescedTiledTensorCompressResult::slot_map)
+        .def_readonly("output_sizes",
+                      &UncoalescedTiledTensorCompressResult::output_sizes)
+        .def_readonly("num_streams",
+                      &UncoalescedTiledTensorCompressResult::num_streams)
+        .def_readonly("stream_len",
+                      &UncoalescedTiledTensorCompressResult::stream_len)
+        .def_readonly("stream_offsets",
+                      &UncoalescedTiledTensorCompressResult::stream_offsets)
+        .def_readonly("num_tiles_n",
+                      &UncoalescedTiledTensorCompressResult::num_tiles_n)
+        .def_readonly("num_tiles_k",
+                      &UncoalescedTiledTensorCompressResult::num_tiles_k)
+        .def_readonly("tile_height",
+                      &UncoalescedTiledTensorCompressResult::tile_height)
+        .def_readonly("tile_width",
+                      &UncoalescedTiledTensorCompressResult::tile_width);
 
     py::class_<RansManager::CompressResult>(m, "CompressResult")
         .def_readonly("success", &RansManager::CompressResult::success)
@@ -300,6 +340,56 @@ PYBIND11_MODULE(ccore, m) {
                      res.stream_len,
                      to_tensor_u32(res.tile_offsets),
                      to_tensor_u32(res.tile_max_lens),
+                     res.num_tiles_n,
+                     res.num_tiles_k,
+                     res.tile_height,
+                     res.tile_width};
+             })
+
+        .def("compress_tiled_uncoalesced",
+             [](RansManager &self, at::Tensor data, at::Tensor freqs,
+                at::Tensor cdf, uint32_t tile_height,
+                uint32_t tile_width) -> UncoalescedTiledTensorCompressResult {
+                 auto shape_vec = data.sizes().vec();
+                 const std::pair<size_t, size_t> shape = {
+                     static_cast<size_t>(shape_vec[0]),
+                     shape_vec.size() > 1 ? static_cast<size_t>(shape_vec[1])
+                                          : 1};
+
+                 // Call the newly updated C++ manager for dense packing
+                 auto res = self.compress_tiled_uncoalesced(
+                     data.data_ptr<uint8_t>(), data.numel(),
+                     freqs.data_ptr<uint16_t>(), cdf.data_ptr<uint16_t>(),
+                     shape, tile_height, tile_width);
+
+                 // Helper to convert std::vector to cloned Torch Tensors
+                 auto to_tensor_u8 = [](const std::vector<uint8_t> &vec) {
+                     if (vec.empty())
+                         return torch::empty({0}, torch::kUInt8);
+                     return torch::from_blob((void *)vec.data(),
+                                             {static_cast<long>(vec.size())},
+                                             torch::kUInt8)
+                         .clone();
+                 };
+                 auto to_tensor_u32 = [](const std::vector<uint32_t> &vec) {
+                     if (vec.empty())
+                         return torch::empty({0}, torch::kUInt32);
+                     return torch::from_blob((void *)vec.data(),
+                                             {static_cast<long>(vec.size())},
+                                             torch::kUInt32)
+                         .clone();
+                 };
+
+                 return UncoalescedTiledTensorCompressResult{
+                     res.success,
+                     to_tensor_u8(res.stream),
+                     to_tensor_u32(res.states),
+                     to_tensor_u32(res.tables),
+                     to_tensor_u8(res.slot_map),
+                     to_tensor_u32(res.sizes),
+                     res.num_streams,
+                     res.stream_len,
+                     to_tensor_u32(res.stream_offsets),
                      res.num_tiles_n,
                      res.num_tiles_k,
                      res.tile_height,

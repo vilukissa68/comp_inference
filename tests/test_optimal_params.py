@@ -493,180 +493,6 @@
 #     )
 #     print("\n✅ Saved IEEE 2-panel Pareto plot to 'rans_pareto_frontiers_ieee.pdf'")
 
-import torch
-import triton
-import os
-import matplotlib.pyplot as plt
-from safetensors import safe_open
-from huggingface_hub import snapshot_download
-import numpy as np
-
-# --- Import your custom modules here ---
-from comp_inference import (
-    rans_compress_module_weight,
-    fused_rans_linear_triton,
-)
-
-WARMUP_RUNS = 50
-EVAL_RUNS = 100
-
-
-def get_compressible_layers(repo_id, num_layers=10):
-    """
-    Dynamically scans safetensors shards and lazily loads the first N
-    weight matrices with dim >= 2. This guarantees we get a diverse
-    sample of real entropy regardless of the model architecture.
-    """
-    print(
-        f"📥 Dynamically fetching the first {num_layers} compressible layers from '{repo_id}'..."
-    )
-    model_path = snapshot_download(
-        repo_id=repo_id, allow_patterns=["*.safetensors"], local_files_only=False
-    )
-
-    weights = {}
-    for filename in sorted(os.listdir(model_path)):
-        if not filename.endswith(".safetensors"):
-            continue
-        filepath = os.path.join(model_path, filename)
-
-        with safe_open(filepath, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if len(weights) >= num_layers:
-                    return weights
-
-                # Skip embedding and LM_head
-                if "embed" in key.lower() or "lm_head" in key.lower():
-                    continue
-                # Use get_slice to check shape BEFORE loading to save RAM
-                shape = f.get_slice(key).get_shape()
-
-                # We only want linear layers (dim >= 2).
-                # Skip embeddings if they are massive (e.g., vocab size > 100k) to focus on standard projections
-                if len(shape) >= 2 and shape[0] < 100000:
-                    w = f.get_tensor(key).cuda().to(torch.bfloat16).t().contiguous()
-                    weights[key] = w
-                    print(f"   ✅ Loaded {key}: {w.shape}")
-
-    if len(weights) == 0:
-        raise ValueError("Failed to find any 2D tensors in the safetensors shards.")
-
-    return weights
-
-
-def profile_function(func):
-    for _ in range(WARMUP_RUNS):
-        func()
-    torch.cuda.synchronize()
-
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(EVAL_RUNS)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(EVAL_RUNS)]
-
-    for i in range(EVAL_RUNS):
-        start_events[i].record()
-        func()
-        end_events[i].record()
-
-    torch.cuda.synchronize()
-    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-    return np.median(times_ms)
-
-
-def test_single_matrix(weights_kn, tile_height, tile_width, batch_size):
-    K, N = weights_kn.shape
-    x = torch.randn((batch_size, K), dtype=torch.bfloat16, device="cuda")
-    weights_kn_cpu = weights_kn.cpu().pin_memory()
-
-    module = torch.nn.Module()
-    module.weight = torch.nn.Parameter(weights_kn.clone())
-    module.bias = None
-    rans_compress_module_weight(
-        module, tile_height=tile_height, tile_width=tile_width, transpose_weight=False
-    )
-
-    exp_comp_cuda = module.exponent_compressed_weight.cuda()
-    man_raw_cuda = module.mantissa_raw.cuda()
-    exp_states_cuda = module.exponent_states.cuda()
-    exp_tables_cuda = module.exponent_tables.cuda()
-    exp_slot_map_cuda = module.exponent_slot_map.cuda()
-    exp_tile_offsets_cuda = module.exponent_tile_offsets.cuda()
-    exp_tile_max_lens_cuda = module.exponent_tile_max_lens.cuda()
-
-    exp_comp_cpu = module.exponent_compressed_weight.cpu().pin_memory()
-    man_raw_cpu = module.mantissa_raw.cpu().pin_memory()
-    exp_states_cpu = module.exponent_states.cpu().pin_memory()
-    exp_tables_cpu = module.exponent_tables.cpu().pin_memory()
-    exp_slot_map_cpu = module.exponent_slot_map.cpu().pin_memory()
-    exp_tile_offsets_cpu = module.exponent_tile_offsets.cpu().pin_memory()
-    exp_tile_max_lens_cpu = module.exponent_tile_max_lens.cpu().pin_memory()
-
-    original_bytes = weights_kn.numel() * 2
-    compressed_bytes = (
-        exp_comp_cuda.numel() * 1
-        + man_raw_cuda.numel() * 1
-        + exp_states_cuda.numel() * 4
-        + exp_tables_cuda.numel() * 4
-        + exp_slot_map_cuda.numel() * 1
-        + exp_tile_offsets_cuda.numel() * 4
-        + exp_tile_max_lens_cuda.numel() * 4
-    )
-
-    def run_baseline_onboard():
-        return torch.matmul(x, weights_kn)
-
-    def run_baseline_offload():
-        w_cuda = weights_kn_cpu.to("cuda", non_blocking=True)
-        return torch.matmul(x, w_cuda)
-
-    def run_fused_onboard():
-        return fused_rans_linear_triton(
-            x=x,
-            compressed_data=exp_comp_cuda,
-            initial_states=exp_states_cuda,
-            tables=exp_tables_cuda,
-            slot_map=exp_slot_map_cuda,
-            weight_shape=(K, N),
-            tile_offsets=exp_tile_offsets_cuda,
-            tile_max_lens=exp_tile_max_lens_cuda,
-            tile_k=tile_height,
-            tile_n=tile_width,
-            mantissas=man_raw_cuda,
-            accum_block_size=tile_width,
-        )
-
-    def run_fused_offload():
-        c_comp = exp_comp_cpu.to("cuda", non_blocking=True)
-        c_states = exp_states_cpu.to("cuda", non_blocking=True)
-        c_tables = exp_tables_cpu.to("cuda", non_blocking=True)
-        c_slots = exp_slot_map_cpu.to("cuda", non_blocking=True)
-        c_offsets = exp_tile_offsets_cpu.to("cuda", non_blocking=True)
-        c_lens = exp_tile_max_lens_cpu.to("cuda", non_blocking=True)
-        c_man = man_raw_cpu.to("cuda", non_blocking=True)
-        return fused_rans_linear_triton(
-            x=x,
-            compressed_data=c_comp,
-            initial_states=c_states,
-            tables=c_tables,
-            slot_map=c_slots,
-            weight_shape=(K, N),
-            tile_offsets=c_offsets,
-            tile_max_lens=c_lens,
-            tile_k=tile_height,
-            tile_n=tile_width,
-            mantissas=c_man,
-            accum_block_size=tile_width,
-        )
-
-    return {
-        "orig_bytes": original_bytes,
-        "comp_bytes": compressed_bytes,
-        "ms_base_on": profile_function(run_baseline_onboard),
-        "ms_base_off": profile_function(run_baseline_offload),
-        "ms_fused_on": profile_function(run_fused_onboard),
-        "ms_fused_off": profile_function(run_fused_offload),
-    }
-
-
 # def plot_pareto_frontier(results):
 #     """
 #     Plots the aggregated 10-layer results into a single IEEE-compliant panel.
@@ -800,19 +626,1192 @@ def test_single_matrix(weights_kn, tile_height, tile_width, batch_size):
 #         "\n✅ Saved IEEE-formatted Aggregate Pareto plot to 'rans_pareto_10_layers_ieee.pdf'"
 #     )
 
+
+# __________________________________THIS WORKS____________________________________
+
+# import torch
+# import triton
+# import os
+# import matplotlib.pyplot as plt
+# from safetensors import safe_open
+# from huggingface_hub import snapshot_download
+# import numpy as np
+
+# # --- Import your custom modules here ---
+# from comp_inference import (
+#     rans_compress_module_weight,
+#     fused_rans_linear_triton,
+# )
+
+# WARMUP_RUNS = 50
+# EVAL_RUNS = 100
+
+
+# def get_compressible_layers(repo_id, num_layers=10):
+#     """
+#     Dynamically scans safetensors shards and lazily loads the first N
+#     weight matrices with dim >= 2. This guarantees we get a diverse
+#     sample of real entropy regardless of the model architecture.
+#     """
+#     print(
+#         f"📥 Dynamically fetching the first {num_layers} compressible layers from '{repo_id}'..."
+#     )
+#     model_path = snapshot_download(
+#         repo_id=repo_id, allow_patterns=["*.safetensors"], local_files_only=False
+#     )
+
+#     weights = {}
+#     for filename in sorted(os.listdir(model_path)):
+#         if not filename.endswith(".safetensors"):
+#             continue
+#         filepath = os.path.join(model_path, filename)
+
+#         with safe_open(filepath, framework="pt", device="cpu") as f:
+#             for key in f.keys():
+#                 if len(weights) >= num_layers:
+#                     return weights
+
+#                 # Skip embedding and LM_head
+#                 if "embed" in key.lower() or "lm_head" in key.lower():
+#                     continue
+#                 # Use get_slice to check shape BEFORE loading to save RAM
+#                 shape = f.get_slice(key).get_shape()
+
+#                 # We only want linear layers (dim >= 2).
+#                 # Skip embeddings if they are massive (e.g., vocab size > 100k) to focus on standard projections
+#                 if len(shape) >= 2 and shape[0] < 100000:
+#                     w = f.get_tensor(key).cuda().to(torch.bfloat16).t().contiguous()
+#                     weights[key] = w
+#                     print(f"   ✅ Loaded {key}: {w.shape}")
+
+#     if len(weights) == 0:
+#         raise ValueError("Failed to find any 2D tensors in the safetensors shards.")
+
+#     return weights
+
+
+# def profile_function(func):
+#     for _ in range(WARMUP_RUNS):
+#         func()
+#     torch.cuda.synchronize()
+
+#     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(EVAL_RUNS)]
+#     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(EVAL_RUNS)]
+
+#     for i in range(EVAL_RUNS):
+#         start_events[i].record()
+#         func()
+#         end_events[i].record()
+
+#     torch.cuda.synchronize()
+#     times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+#     return np.median(times_ms)
+
+
+# def test_single_matrix(weights_kn, tile_height, tile_width, batch_size):
+#     K, N = weights_kn.shape
+#     x = torch.randn((batch_size, K), dtype=torch.bfloat16, device="cuda")
+#     weights_kn_cpu = weights_kn.cpu().pin_memory()
+
+#     module = torch.nn.Module()
+#     module.weight = torch.nn.Parameter(weights_kn.clone())
+#     module.bias = None
+#     rans_compress_module_weight(
+#         module, tile_height=tile_height, tile_width=tile_width, transpose_weight=False
+#     )
+
+#     exp_comp_cuda = module.exponent_compressed_weight.cuda()
+#     man_raw_cuda = module.mantissa_raw.cuda()
+#     exp_states_cuda = module.exponent_states.cuda()
+#     exp_tables_cuda = module.exponent_tables.cuda()
+#     exp_slot_map_cuda = module.exponent_slot_map.cuda()
+#     exp_tile_offsets_cuda = module.exponent_tile_offsets.cuda()
+#     exp_tile_max_lens_cuda = module.exponent_tile_max_lens.cuda()
+
+#     exp_comp_cpu = module.exponent_compressed_weight.cpu().pin_memory()
+#     man_raw_cpu = module.mantissa_raw.cpu().pin_memory()
+#     exp_states_cpu = module.exponent_states.cpu().pin_memory()
+#     exp_tables_cpu = module.exponent_tables.cpu().pin_memory()
+#     exp_slot_map_cpu = module.exponent_slot_map.cpu().pin_memory()
+#     exp_tile_offsets_cpu = module.exponent_tile_offsets.cpu().pin_memory()
+#     exp_tile_max_lens_cpu = module.exponent_tile_max_lens.cpu().pin_memory()
+
+#     original_bytes = weights_kn.numel() * 2
+#     compressed_bytes = (
+#         exp_comp_cuda.numel() * 1
+#         + man_raw_cuda.numel() * 1
+#         + exp_states_cuda.numel() * 4
+#         + exp_tables_cuda.numel() * 4
+#         + exp_slot_map_cuda.numel() * 1
+#         + exp_tile_offsets_cuda.numel() * 4
+#         + exp_tile_max_lens_cuda.numel() * 4
+#     )
+
+#     def run_baseline_onboard():
+#         return torch.matmul(x, weights_kn)
+
+#     def run_baseline_offload():
+#         w_cuda = weights_kn_cpu.to("cuda", non_blocking=True)
+#         return torch.matmul(x, w_cuda)
+
+#     def run_fused_onboard():
+#         return fused_rans_linear_triton(
+#             x=x,
+#             compressed_data=exp_comp_cuda,
+#             initial_states=exp_states_cuda,
+#             tables=exp_tables_cuda,
+#             slot_map=exp_slot_map_cuda,
+#             weight_shape=(K, N),
+#             tile_offsets=exp_tile_offsets_cuda,
+#             tile_max_lens=exp_tile_max_lens_cuda,
+#             tile_k=tile_height,
+#             tile_n=tile_width,
+#             mantissas=man_raw_cuda,
+#             accum_block_size=tile_width,
+#         )
+
+#     def run_fused_offload():
+#         c_comp = exp_comp_cpu.to("cuda", non_blocking=True)
+#         c_states = exp_states_cpu.to("cuda", non_blocking=True)
+#         c_tables = exp_tables_cpu.to("cuda", non_blocking=True)
+#         c_slots = exp_slot_map_cpu.to("cuda", non_blocking=True)
+#         c_offsets = exp_tile_offsets_cpu.to("cuda", non_blocking=True)
+#         c_lens = exp_tile_max_lens_cpu.to("cuda", non_blocking=True)
+#         c_man = man_raw_cpu.to("cuda", non_blocking=True)
+#         return fused_rans_linear_triton(
+#             x=x,
+#             compressed_data=c_comp,
+#             initial_states=c_states,
+#             tables=c_tables,
+#             slot_map=c_slots,
+#             weight_shape=(K, N),
+#             tile_offsets=c_offsets,
+#             tile_max_lens=c_lens,
+#             tile_k=tile_height,
+#             tile_n=tile_width,
+#             mantissas=c_man,
+#             accum_block_size=tile_width,
+#         )
+
+#     return {
+#         "orig_bytes": original_bytes,
+#         "comp_bytes": compressed_bytes,
+#         "ms_base_on": profile_function(run_baseline_onboard),
+#         "ms_base_off": profile_function(run_baseline_offload),
+#         "ms_fused_on": profile_function(run_fused_onboard),
+#         "ms_fused_off": profile_function(run_fused_offload),
+#     }
+
+
+# from adjustText import adjust_text
+
+
+# def plot_pareto_frontier(results):
+#     """
+#     Plots the aggregated 10-layer results into a single IEEE-compliant panel.
+#     """
+#     plt.rcParams.update(
+#         {
+#             "font.family": "serif",
+#             "font.size": 8,
+#             "axes.labelsize": 8,
+#             "legend.fontsize": 8,
+#             "xtick.labelsize": 8,
+#             "ytick.labelsize": 8,
+#         }
+#     )
+
+#     fig, ax = plt.subplots(figsize=(3.5, 3.0))
+
+#     onboard_pts = [
+#         (r["ratio"], r["ms_fused_on"], f"{r['H']}x{r['W']}") for r in results
+#     ]
+#     offload_pts = [
+#         (r["ratio"], r["ms_fused_off"], f"{r['H']}x{r['W']}") for r in results
+#     ]
+
+#     def get_pareto(points):
+#         sorted_pts = sorted(points, key=lambda x: x[0])
+#         front = []
+#         min_y = float("inf")
+#         for pt in sorted_pts:
+#             if pt[1] < min_y:
+#                 front.append(pt)
+#                 min_y = pt[1]
+#         return front
+
+#     pareto_on = get_pareto(onboard_pts)
+#     pareto_off = get_pareto(offload_pts)
+
+#     # Scatters
+#     ax.scatter(
+#         [p[0] for p in onboard_pts],
+#         [p[1] for p in onboard_pts],
+#         color="#82C8F0",
+#         alpha=0.6,
+#         s=15,
+#         label="rANS Onboard",
+#     )
+#     ax.scatter(
+#         [p[0] for p in offload_pts],
+#         [p[1] for p in offload_pts],
+#         color="#F5A5C8",
+#         alpha=0.6,
+#         s=15,
+#         label="rANS Offloaded",
+#     )
+
+#     # Pareto Lines
+#     ax.plot(
+#         [p[0] for p in pareto_on],
+#         [p[1] for p in pareto_on],
+#         color="#82C8F0",
+#         linestyle="-",
+#         linewidth=1,
+#     )
+#     ax.plot(
+#         [p[0] for p in pareto_off],
+#         [p[1] for p in pareto_off],
+#         color="#F5A5C8",
+#         linestyle="-",
+#         linewidth=1,
+#     )
+
+#     # Baselines
+#     avg_base_on = np.mean([r["ms_base_on"] for r in results])
+#     avg_base_off = np.mean([r["ms_base_off"] for r in results])
+
+#     ax.axhline(
+#         avg_base_on,
+#         color="#7DCDBE",
+#         linestyle="--",
+#         linewidth=1,
+#         label=f"Base On ({avg_base_on:.1f}ms)",
+#     )
+#     ax.axhline(
+#         avg_base_off,
+#         color="#FFDCA5",
+#         linestyle=":",
+#         linewidth=1.5,
+#         label=f"Base Off ({avg_base_off:.1f}ms)",
+#     )
+
+#     # --- THE FIX: Collect text objects and use adjustText ---
+#     texts = []
+#     for pt in onboard_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=5.5,
+#                 # color="#82C8F0",
+#                 color="#000000",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+
+#     for pt in offload_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=5.5,
+#                 # color="#F5A5C8",
+#                 color="#000000",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+
+#     print("Repelling overlapping text labels...")
+#     adjust_text(
+#         texts,
+#         ax=ax,
+#         arrowprops=dict(arrowstyle="-", color="gray", lw=0.3, alpha=0.6),
+#         expand_points=(1.2, 1.2),
+#         force_text=(0.5, 1.0),
+#     )
+#     # --------------------------------------------------------
+
+#     ax.set_xlabel("Aggregated Compression Ratio (Lower is Better)", fontweight="bold")
+#     ax.set_ylabel("10-Layer Aggregated Latency (ms)", fontweight="bold")
+#     ax.grid(True, alpha=0.25, linestyle="--")
+
+#     ax.legend(
+#         loc="upper center",
+#         bbox_to_anchor=(0.5, 1.25),
+#         ncol=2,
+#         frameon=False,
+#         columnspacing=0.8,
+#     )
+#     plt.subplots_adjust(top=0.78, bottom=0.15, left=0.15, right=0.98)
+
+#     plt.savefig("rans_pareto_10_layers_ieee.pdf", format="pdf", dpi=300)
+#     print(
+#         "\n✅ Saved IEEE-formatted Aggregate Pareto plot to 'rans_pareto_10_layers_ieee.pdf'"
+#     )
+
+
+# if __name__ == "__main__":
+#     MODEL_PATH = "Qwen/Qwen3-14B"
+#     heights = [256, 512, 1024, 2048, 4096]
+#     widths = [32, 64, 128, 256]
+#     BATCH_SIZE = 1
+#     NUM_LAYERS = 15
+
+#     print(f"\nStarting 10-Layer Ablation Study | Batch Size: {BATCH_SIZE}")
+#     real_weights = get_compressible_layers(MODEL_PATH, num_layers=NUM_LAYERS)
+
+#     results = []
+
+#     print("-" * 110)
+#     print(
+#         f"| {'Tile':^10} | {'Ratio':^7} | {'Base On (ms)':^12} | {'Base Off (ms)':^13} | {'rANS On (ms)':^12} | {'rANS Off (ms)':^13} |"
+#     )
+#     print("-" * 110)
+
+#     for h in heights:
+#         for w in widths:
+#             tot_orig = (
+#                 tot_comp
+#             ) = tot_base_on = tot_base_off = tot_fused_on = tot_fused_off = 0.0
+
+#             for name, weight_tensor in real_weights.items():
+#                 res = test_single_matrix(
+#                     weight_tensor, tile_height=h, tile_width=w, batch_size=BATCH_SIZE
+#                 )
+#                 tot_orig += res["orig_bytes"]
+#                 tot_comp += res["comp_bytes"]
+#                 tot_base_on += res["ms_base_on"]
+#                 tot_base_off += res["ms_base_off"]
+#                 tot_fused_on += res["ms_fused_on"]
+#                 tot_fused_off += res["ms_fused_off"]
+
+#             ratio = tot_comp / tot_orig
+
+#             results.append(
+#                 {
+#                     "H": h,
+#                     "W": w,
+#                     "ratio": ratio,
+#                     "ms_base_on": tot_base_on,
+#                     "ms_base_off": tot_base_off,
+#                     "ms_fused_on": tot_fused_on,
+#                     "ms_fused_off": tot_fused_off,
+#                 }
+#             )
+
+#             print(
+#                 f"| {h:>4}x{w:<4} | {ratio:^7.3f}x | {tot_base_on:^12.2f} | {tot_base_off:^13.2f} | {tot_fused_on:^12.2f} | {tot_fused_off:^13.2f} |"
+#             )
+
+#     plot_pareto_frontier(results)
+WARMUP_RUNS = 50
+EVAL_RUNS = 100
+
+
+# def get_compressible_layers(repo_id, num_layers=10):
+#     print(
+#         f"📥 Dynamically fetching the first {num_layers} compressible layers from '{repo_id}'..."
+#     )
+#     model_path = snapshot_download(
+#         repo_id=repo_id, allow_patterns=["*.safetensors"], local_files_only=False
+#     )
+
+#     weights = {}
+#     for filename in sorted(os.listdir(model_path)):
+#         if not filename.endswith(".safetensors"):
+#             continue
+#         filepath = os.path.join(model_path, filename)
+
+#         with safe_open(filepath, framework="pt", device="cpu") as f:
+#             for key in f.keys():
+#                 if len(weights) >= num_layers:
+#                     return weights
+
+#                 if "embed" in key.lower() or "lm_head" in key.lower():
+#                     continue
+
+#                 shape = f.get_slice(key).get_shape()
+#                 if len(shape) >= 2 and shape[0] < 100000:
+#                     w = f.get_tensor(key).cuda().to(torch.bfloat16).t().contiguous()
+#                     weights[key] = w
+#                     print(f"   ✅ Loaded {key}: {w.shape}")
+
+#     if len(weights) == 0:
+#         raise ValueError("Failed to find any 2D tensors in the safetensors shards.")
+#     return weights
+
+
+def get_compressible_layers(repo_id, num_layers=None):
+    if num_layers is None:
+        print(f"📥 Dynamically fetching ALL compressible layers from '{repo_id}'...")
+    else:
+        print(
+            f"📥 Dynamically fetching the first {num_layers} compressible layers from '{repo_id}'..."
+        )
+
+    model_path = snapshot_download(
+        repo_id=repo_id, allow_patterns=["*.safetensors"], local_files_only=False
+    )
+
+    weights = {}
+    for filename in sorted(os.listdir(model_path)):
+        if not filename.endswith(".safetensors"):
+            continue
+        filepath = os.path.join(model_path, filename)
+
+        with safe_open(filepath, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                # Only break early if a specific number of layers was requested
+                if num_layers is not None and len(weights) >= num_layers:
+                    return weights
+
+                if "embed" in key.lower() or "lm_head" in key.lower():
+                    continue
+
+                shape = f.get_slice(key).get_shape()
+                if len(shape) >= 2 and shape[0] < 100000:
+                    w = f.get_tensor(key).cuda().to(torch.bfloat16).t().contiguous()
+                    weights[key] = w
+                    print(f"   ✅ Loaded {key}: {w.shape}")
+
+    if len(weights) == 0:
+        raise ValueError("Failed to find any 2D tensors in the safetensors shards.")
+
+    print(f"🎉 Successfully loaded all {len(weights)} layers!")
+    return weights
+
+
+def profile_function(func):
+    for _ in range(WARMUP_RUNS):
+        func()
+    torch.cuda.synchronize()
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(EVAL_RUNS)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(EVAL_RUNS)]
+
+    for i in range(EVAL_RUNS):
+        start_events[i].record()
+        func()
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    return np.median(times_ms)
+
+
+def test_single_matrix(weights_kn, tile_height, tile_width, batch_size):
+    K, N = weights_kn.shape
+    x = torch.randn((batch_size, K), dtype=torch.bfloat16, device="cuda")
+    weights_kn_cpu = weights_kn.cpu().pin_memory()
+    original_bytes = weights_kn.numel() * 2
+
+    # ==========================================
+    # 1. COALESCED (Legacy Padded) Setup
+    # ==========================================
+    mod_coal = torch.nn.Module()
+    mod_coal.weight = torch.nn.Parameter(weights_kn.clone())
+    mod_coal.bias = None
+    rans_compress_module_weight(
+        mod_coal,
+        tile_height=tile_height,
+        tile_width=tile_width,
+        transpose_weight=False,
+        uncoalesced_interleaving=False,
+    )
+
+    c_exp_comp_cuda = mod_coal.exponent_compressed_weight.cuda()
+    c_man_raw_cuda = mod_coal.mantissa_raw.cuda()
+    c_exp_states_cuda = mod_coal.exponent_states.cuda()
+    c_exp_tables_cuda = mod_coal.exponent_tables.cuda()
+    c_exp_slot_map_cuda = mod_coal.exponent_slot_map.cuda()
+    c_exp_tile_offsets_cuda = mod_coal.exponent_tile_offsets.cuda()
+    c_exp_tile_max_lens_cuda = mod_coal.exponent_tile_max_lens.cuda()
+
+    c_exp_comp_cpu = mod_coal.exponent_compressed_weight.cpu().pin_memory()
+    c_man_raw_cpu = mod_coal.mantissa_raw.cpu().pin_memory()
+    c_exp_states_cpu = mod_coal.exponent_states.cpu().pin_memory()
+    c_exp_tables_cpu = mod_coal.exponent_tables.cpu().pin_memory()
+    c_exp_slot_map_cpu = mod_coal.exponent_slot_map.cpu().pin_memory()
+    c_exp_tile_offsets_cpu = mod_coal.exponent_tile_offsets.cpu().pin_memory()
+    c_exp_tile_max_lens_cpu = mod_coal.exponent_tile_max_lens.cpu().pin_memory()
+
+    bytes_coal = (
+        c_exp_comp_cuda.numel() * 1
+        + c_man_raw_cuda.numel() * 1
+        + c_exp_states_cuda.numel() * 4
+        + c_exp_tables_cuda.numel() * 4
+        + c_exp_slot_map_cuda.numel() * 2
+        + c_exp_tile_offsets_cuda.numel() * 4
+        + c_exp_tile_max_lens_cuda.numel() * 4
+    )
+
+    # ==========================================
+    # 2. UNCOALESCED (Dense Packed) Setup
+    # ==========================================
+    mod_uncoal = torch.nn.Module()
+    mod_uncoal.weight = torch.nn.Parameter(weights_kn.clone())
+    mod_uncoal.bias = None
+    rans_compress_module_weight(
+        mod_uncoal,
+        tile_height=tile_height,
+        tile_width=tile_width,
+        transpose_weight=False,
+        uncoalesced_interleaving=True,
+    )
+
+    u_exp_comp_cuda = mod_uncoal.exponent_compressed_weight.cuda()
+    u_man_raw_cuda = mod_uncoal.mantissa_raw.cuda()
+    u_exp_states_cuda = mod_uncoal.exponent_states.cuda()
+    u_exp_tables_cuda = mod_uncoal.exponent_tables.cuda()
+    u_exp_slot_map_cuda = mod_uncoal.exponent_slot_map.cuda()
+    u_exp_stream_offsets_cuda = mod_uncoal.exponent_stream_offsets.cuda()
+
+    # Pre-calculate sizes for Uncoalesced Onboard safely
+    u_offsets_i64 = u_exp_stream_offsets_cuda.to(torch.int64)
+    u_tot_bytes = torch.tensor(
+        [u_exp_comp_cuda.numel()], dtype=torch.int64, device="cuda"
+    )
+    u_stream_sizes_cuda = (
+        torch.cat([u_offsets_i64[1:], u_tot_bytes]) - u_offsets_i64
+    ).to(torch.uint32)
+
+    u_exp_comp_cpu = mod_uncoal.exponent_compressed_weight.cpu().pin_memory()
+    u_man_raw_cpu = mod_uncoal.mantissa_raw.cpu().pin_memory()
+    u_exp_states_cpu = mod_uncoal.exponent_states.cpu().pin_memory()
+    u_exp_tables_cpu = mod_uncoal.exponent_tables.cpu().pin_memory()
+    u_exp_slot_map_cpu = mod_uncoal.exponent_slot_map.cpu().pin_memory()
+    u_exp_stream_offsets_cpu = mod_uncoal.exponent_stream_offsets.cpu().pin_memory()
+
+    bytes_uncoal = (
+        u_exp_comp_cuda.numel() * 1
+        + u_man_raw_cuda.numel() * 1
+        + u_exp_states_cuda.numel() * 4
+        + u_exp_tables_cuda.numel() * 4
+        + u_exp_slot_map_cuda.numel() * 2
+        + u_exp_stream_offsets_cuda.numel() * 4
+    )
+
+    # ==========================================
+    # RUNNERS
+    # ==========================================
+    def run_base_on():
+        return torch.matmul(x, weights_kn)
+
+    def run_base_off():
+        return torch.matmul(x, weights_kn_cpu.to("cuda", non_blocking=True))
+
+    def run_coal_on():
+        return fused_rans_linear_triton(
+            x=x,
+            compressed_data=c_exp_comp_cuda,
+            initial_states=c_exp_states_cuda,
+            tables=c_exp_tables_cuda,
+            slot_map=c_exp_slot_map_cuda,
+            weight_shape=(K, N),
+            tile_offsets=c_exp_tile_offsets_cuda,
+            tile_max_lens=c_exp_tile_max_lens_cuda,
+            tile_k=tile_height,
+            tile_n=tile_width,
+            mantissas=c_man_raw_cuda,
+            accum_block_size=tile_width,
+        )
+
+    def run_coal_off():
+        return fused_rans_linear_triton(
+            x=x,
+            compressed_data=c_exp_comp_cpu.to("cuda", non_blocking=True),
+            initial_states=c_exp_states_cpu.to("cuda", non_blocking=True),
+            tables=c_exp_tables_cpu.to("cuda", non_blocking=True),
+            slot_map=c_exp_slot_map_cpu.to("cuda", non_blocking=True),
+            weight_shape=(K, N),
+            tile_offsets=c_exp_tile_offsets_cpu.to("cuda", non_blocking=True),
+            tile_max_lens=c_exp_tile_max_lens_cpu.to("cuda", non_blocking=True),
+            tile_k=tile_height,
+            tile_n=tile_width,
+            mantissas=c_man_raw_cpu.to("cuda", non_blocking=True),
+            accum_block_size=tile_width,
+        )
+
+    def run_uncoal_on():
+        return fused_rans_linear_triton_uncoalesced(
+            x=x,
+            compressed_data=u_exp_comp_cuda,
+            initial_states=u_exp_states_cuda,
+            tables=u_exp_tables_cuda,
+            slot_map=u_exp_slot_map_cuda,
+            weight_shape=(K, N),
+            stream_offsets=u_exp_stream_offsets_cuda,
+            stream_sizes=u_stream_sizes_cuda,
+            tile_k=tile_height,
+            tile_n=tile_width,
+            mantissas=u_man_raw_cuda,
+            accum_block_size=tile_width,
+        )
+
+    def run_uncoal_off():
+        comp = u_exp_comp_cpu.to("cuda", non_blocking=True)
+        offs = u_exp_stream_offsets_cpu.to("cuda", non_blocking=True)
+
+        # Recalculate sizes on GPU for offloaded variables
+        o_i64 = offs.to(torch.int64)
+        t_b = torch.tensor([comp.numel()], dtype=torch.int64, device="cuda")
+        s_sizes = (torch.cat([o_i64[1:], t_b]) - o_i64).to(torch.uint32)
+
+        return fused_rans_linear_triton_uncoalesced(
+            x=x,
+            compressed_data=comp,
+            initial_states=u_exp_states_cpu.to("cuda", non_blocking=True),
+            tables=u_exp_tables_cpu.to("cuda", non_blocking=True),
+            slot_map=u_exp_slot_map_cpu.to("cuda", non_blocking=True),
+            weight_shape=(K, N),
+            stream_offsets=offs,
+            stream_sizes=s_sizes,
+            tile_k=tile_height,
+            tile_n=tile_width,
+            mantissas=u_man_raw_cpu.to("cuda", non_blocking=True),
+            accum_block_size=tile_width,
+        )
+
+    return {
+        "orig_bytes": original_bytes,
+        "bytes_coal": bytes_coal,
+        "bytes_uncoal": bytes_uncoal,
+        "ms_base_on": profile_function(run_base_on),
+        "ms_base_off": profile_function(run_base_off),
+        "ms_coal_on": profile_function(run_coal_on),
+        "ms_coal_off": profile_function(run_coal_off),
+        "ms_uncoal_on": profile_function(run_uncoal_on),
+        "ms_uncoal_off": profile_function(run_uncoal_off),
+    }
+
+
 from adjustText import adjust_text
 
 
+# def plot_pareto_frontier(results):
+#     plt.rcParams.update(
+#         {
+#             "font.family": "serif",
+#             "font.size": 8,
+#             "axes.labelsize": 8,
+#             "legend.fontsize": 7,
+#             "xtick.labelsize": 8,
+#             "ytick.labelsize": 8,
+#         }
+#     )
+
+#     fig, ax = plt.subplots(figsize=(3.5, 3.0))
+
+#     # 4 distinct configurations
+#     c_on_pts = [(r["r_coal"], r["ms_c_on"], f"{r['H']}x{r['W']}") for r in results]
+#     c_off_pts = [(r["r_coal"], r["ms_c_off"], f"{r['H']}x{r['W']}") for r in results]
+#     u_on_pts = [(r["r_uncoal"], r["ms_u_on"], f"{r['H']}x{r['W']}") for r in results]
+#     u_off_pts = [(r["r_uncoal"], r["ms_u_off"], f"{r['H']}x{r['W']}") for r in results]
+
+#     def get_pareto(points):
+#         sorted_pts = sorted(points, key=lambda x: x[0])
+#         front = []
+#         min_y = float("inf")
+#         for pt in sorted_pts:
+#             if pt[1] < min_y:
+#                 front.append(pt)
+#                 min_y = pt[1]
+#         return front
+
+#     p_c_on = get_pareto(c_on_pts)
+#     p_c_off = get_pareto(c_off_pts)
+#     p_u_on = get_pareto(u_on_pts)
+#     p_u_off = get_pareto(u_off_pts)
+
+#     # Scatters (Differentiating Coalesced vs Uncoalesced by color)
+#     ax.scatter(
+#         [p[0] for p in c_on_pts],
+#         [p[1] for p in c_on_pts],
+#         color="#aec7e8",
+#         alpha=0.8,
+#         s=15,
+#         label="Coal Onboard",
+#     )
+#     ax.scatter(
+#         [p[0] for p in u_on_pts],
+#         [p[1] for p in u_on_pts],
+#         color="#1f77b4",
+#         alpha=0.8,
+#         s=15,
+#         label="Uncoal Onboard",
+#     )
+#     ax.scatter(
+#         [p[0] for p in c_off_pts],
+#         [p[1] for p in c_off_pts],
+#         color="#ff9896",
+#         alpha=0.8,
+#         s=15,
+#         label="Coal Offload",
+#     )
+#     ax.scatter(
+#         [p[0] for p in u_off_pts],
+#         [p[1] for p in u_off_pts],
+#         color="#d62728",
+#         alpha=0.8,
+#         s=15,
+#         label="Uncoal Offload",
+#     )
+
+#     # Pareto Lines
+#     ax.plot(
+#         [p[0] for p in p_c_on],
+#         [p[1] for p in p_c_on],
+#         color="#aec7e8",
+#         linestyle="--",
+#         linewidth=1,
+#     )
+#     ax.plot(
+#         [p[0] for p in p_u_on],
+#         [p[1] for p in p_u_on],
+#         color="#1f77b4",
+#         linestyle="-",
+#         linewidth=1.5,
+#     )
+#     ax.plot(
+#         [p[0] for p in p_c_off],
+#         [p[1] for p in p_c_off],
+#         color="#ff9896",
+#         linestyle="--",
+#         linewidth=1,
+#     )
+#     ax.plot(
+#         [p[0] for p in p_u_off],
+#         [p[1] for p in p_u_off],
+#         color="#d62728",
+#         linestyle="-",
+#         linewidth=1.5,
+#     )
+
+#     # Baselines
+#     avg_base_on = np.mean([r["ms_base_on"] for r in results])
+#     avg_base_off = np.mean([r["ms_base_off"] for r in results])
+
+#     ax.axhline(
+#         avg_base_on,
+#         color="#2ca02c",
+#         linestyle="-.",
+#         linewidth=1,
+#         label=f"Base On ({avg_base_on:.1f}ms)",
+#     )
+#     ax.axhline(
+#         avg_base_off,
+#         color="#ff7f0e",
+#         linestyle=":",
+#         linewidth=1.5,
+#         label=f"Base Off ({avg_base_off:.1f}ms)",
+#     )
+
+#     # Collect texts (Color-matching the texts to their dots for clarity)
+#     texts = []
+#     for pt in c_on_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#8ab3d4",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+#     for pt in u_on_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#1f77b4",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+#     for pt in c_off_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#e6807e",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+#     for pt in u_off_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#d62728",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+
+#     print("Repelling overlapping text labels...")
+#     adjust_text(
+#         texts,
+#         ax=ax,
+#         arrowprops=dict(arrowstyle="-", color="gray", lw=0.2, alpha=0.5),
+#         expand_points=(1.3, 1.3),
+#         force_text=(0.5, 1.2),
+#     )
+
+#     ax.set_xlabel("Aggregated Compression Ratio (Lower is Better)", fontweight="bold")
+#     ax.set_ylabel(
+#         f"{len(results)//len(set([r['H'] for r in results]))}-Layer Aggregated Latency (ms)",
+#         fontweight="bold",
+#     )
+#     ax.grid(True, alpha=0.25, linestyle="--")
+
+#     ax.legend(
+#         loc="upper center",
+#         bbox_to_anchor=(0.5, 1.35),
+#         ncol=3,
+#         frameon=False,
+#         columnspacing=0.8,
+#     )
+#     plt.subplots_adjust(top=0.74, bottom=0.15, left=0.15, right=0.98)
+
+#     plt.savefig("rans_pareto_4way_ieee.pdf", format="pdf", dpi=300)
+#     print(
+#         "\n✅ Saved IEEE-formatted Aggregate Pareto plot to 'rans_pareto_4way_ieee.pdf'"
+#     )
+
+
+# def plot_pareto_frontier(results):
+#     from adjustText import adjust_text
+#     import matplotlib.pyplot as plt
+#     import numpy as np
+
+#     plt.rcParams.update(
+#         {
+#             "font.family": "serif",
+#             "font.size": 8,
+#             "axes.labelsize": 8,
+#             "legend.fontsize": 7,
+#             "xtick.labelsize": 8,
+#             "ytick.labelsize": 8,
+#         }
+#     )
+
+#     fig, ax = plt.subplots(figsize=(3.5, 3.0))
+
+#     # 4 distinct configurations
+#     c_on_pts = [(r["r_coal"], r["ms_c_on"], f"{r['H']}x{r['W']}") for r in results]
+#     c_off_pts = [(r["r_coal"], r["ms_c_off"], f"{r['H']}x{r['W']}") for r in results]
+#     u_on_pts = [(r["r_uncoal"], r["ms_u_on"], f"{r['H']}x{r['W']}") for r in results]
+#     u_off_pts = [(r["r_uncoal"], r["ms_u_off"], f"{r['H']}x{r['W']}") for r in results]
+
+#     def get_pareto(points):
+#         sorted_pts = sorted(points, key=lambda x: x[0])
+#         front = []
+#         min_y = float("inf")
+#         for pt in sorted_pts:
+#             if pt[1] < min_y:
+#                 front.append(pt)
+#                 min_y = pt[1]
+#         return front
+
+#     p_c_on = get_pareto(c_on_pts)
+#     p_c_off = get_pareto(c_off_pts)
+#     p_u_on = get_pareto(u_on_pts)
+#     p_u_off = get_pareto(u_off_pts)
+
+#     # --- THE FIX: Added distinct `marker` shapes for accessibility ---
+#     # Scatters
+#     ax.scatter(
+#         [p[0] for p in c_on_pts],
+#         [p[1] for p in c_on_pts],
+#         color="#aec7e8",
+#         alpha=0.8,
+#         s=15,
+#         marker="o",
+#         label="Coal Onboard",  # Circle
+#     )
+#     ax.scatter(
+#         [p[0] for p in u_on_pts],
+#         [p[1] for p in u_on_pts],
+#         color="#1f77b4",
+#         alpha=0.8,
+#         s=15,
+#         marker="s",
+#         label="Uncoal Onboard",  # Square
+#     )
+#     ax.scatter(
+#         [p[0] for p in c_off_pts],
+#         [p[1] for p in c_off_pts],
+#         color="#ff9896",
+#         alpha=0.8,
+#         s=15,
+#         marker="^",
+#         label="Coal Offload",  # Triangle
+#     )
+#     ax.scatter(
+#         [p[0] for p in u_off_pts],
+#         [p[1] for p in u_off_pts],
+#         color="#d62728",
+#         alpha=0.8,
+#         s=15,
+#         marker="D",
+#         label="Uncoal Offload",  # Diamond
+#     )
+
+#     # Pareto Lines
+#     ax.plot(
+#         [p[0] for p in p_c_on],
+#         [p[1] for p in p_c_on],
+#         color="#aec7e8",
+#         linestyle="--",
+#         linewidth=1,
+#     )
+#     ax.plot(
+#         [p[0] for p in p_u_on],
+#         [p[1] for p in p_u_on],
+#         color="#1f77b4",
+#         linestyle="-",
+#         linewidth=1.5,
+#     )
+#     ax.plot(
+#         [p[0] for p in p_c_off],
+#         [p[1] for p in p_c_off],
+#         color="#ff9896",
+#         linestyle="--",
+#         linewidth=1,
+#     )
+#     ax.plot(
+#         [p[0] for p in p_u_off],
+#         [p[1] for p in p_u_off],
+#         color="#d62728",
+#         linestyle="-",
+#         linewidth=1.5,
+#     )
+
+#     # Baselines
+#     avg_base_on = np.mean([r["ms_base_on"] for r in results])
+#     avg_base_off = np.mean([r["ms_base_off"] for r in results])
+
+#     ax.axhline(
+#         avg_base_on,
+#         color="#2ca02c",
+#         linestyle="-.",
+#         linewidth=1,
+#         label=f"Base On ({avg_base_on:.1f}ms)",
+#     )
+#     ax.axhline(
+#         avg_base_off,
+#         color="#ff7f0e",
+#         linestyle=":",
+#         linewidth=1.5,
+#         label=f"Base Off ({avg_base_off:.1f}ms)",
+#     )
+
+#     # Collect texts
+#     texts = []
+#     for pt in c_on_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#8ab3d4",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+#     for pt in u_on_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#1f77b4",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+#     for pt in c_off_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#e6807e",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+#     for pt in u_off_pts:
+#         texts.append(
+#             ax.text(
+#                 pt[0],
+#                 pt[1],
+#                 pt[2],
+#                 fontsize=4.5,
+#                 color="#d62728",
+#                 ha="center",
+#                 va="center",
+#             )
+#         )
+
+#     adjust_text(
+#         texts,
+#         ax=ax,
+#         arrowprops=dict(arrowstyle="-", color="gray", lw=0.2, alpha=0.5),
+#         expand_points=(1.3, 1.3),
+#         force_text=(0.5, 1.2),
+#     )
+
+#     ax.margins(x=0.15, y=0.15)
+
+#     ax.set_xlabel("Aggregated Compression Ratio", fontweight="bold")
+#     ax.set_ylabel(
+#         f"{len(results)//len(set([r['H'] for r in results]))}-Layer Aggregated Latency (ms)",
+#         fontweight="bold",
+#     )
+#     ax.grid(True, alpha=0.25, linestyle="--")
+
+#     # Manual Legend Matrix Reordering
+#     handles, labels = ax.get_legend_handles_labels()
+
+#     def get_handle_label(target_substr):
+#         for h, l in zip(handles, labels):
+#             if target_substr in l:
+#                 return h, l
+#         return None, None
+
+#     # Define our logical pairs (Left Column vs Right Column)
+#     row1 = [get_handle_label("Base On"), get_handle_label("Base Off")]
+#     row2 = [get_handle_label("Coal Onboard"), get_handle_label("Uncoal Onboard")]
+#     row3 = [get_handle_label("Coal Offload"), get_handle_label("Uncoal Offload")]
+
+#     # Matplotlib's ncol=2 draws column 1 first, then column 2.
+#     col1_handles = [row1[0][0], row2[0][0], row3[0][0]]
+#     col1_labels = [row1[0][1], row2[0][1], row3[0][1]]
+
+#     col2_handles = [row1[1][0], row2[1][0], row3[1][0]]
+#     col2_labels = [row1[1][1], row2[1][1], row3[1][1]]
+
+#     ordered_handles = col1_handles + col2_handles
+#     ordered_labels = col1_labels + col2_labels
+
+#     ax.legend(
+#         ordered_handles,
+#         ordered_labels,
+#         loc="lower center",
+#         bbox_to_anchor=(0.5, 1.02),
+#         ncol=2,
+#         frameon=False,
+#         columnspacing=0.8,
+#         handletextpad=0.4,
+#     )
+
+#     plt.savefig("rans_pareto_4way_ieee.pdf", format="pdf", dpi=300, bbox_inches="tight")
+#     print(
+#         "\n✅ Saved IEEE-formatted, accessible Aggregate Pareto plot to 'rans_pareto_4way_ieee.pdf'"
+#     )
+#     plt.close()
+
+
+# if __name__ == "__main__":
+#     MODEL_PATH = "Qwen/Qwen3-14B"
+#     heights = [256, 512, 1024]
+#     widths = [32, 64, 128]
+#     BATCH_SIZE = 1
+#     NUM_LAYERS = None
+
+#     print(f"\nStarting {NUM_LAYERS}-Layer Ablation Study | Batch Size: {BATCH_SIZE}")
+#     real_weights = get_compressible_layers(MODEL_PATH, num_layers=NUM_LAYERS)
+
+#     results = []
+
+#     print("-" * 135)
+#     print(
+#         f"| {'Tile':^10} | {'Rat Coal':^8} | {'Rat Unc':^8} | {'Base On':^8} | {'Base Off':^8} | {'Coal On':^8} | {'Uncoal On':^9} | {'Coal Off':^8} | {'Uncoal Off':^10} |"
+#     )
+#     print("-" * 135)
+
+#     for h in heights:
+#         for w in widths:
+#             (
+#                 t_orig,
+#                 t_c_coal,
+#                 t_c_uncoal,
+#                 t_b_on,
+#                 t_b_off,
+#                 t_c_on,
+#                 t_c_off,
+#                 t_u_on,
+#                 t_u_off,
+#             ) = (0.0,) * 9
+
+#             for name, weight_tensor in real_weights.items():
+#                 res = test_single_matrix(
+#                     weight_tensor, tile_height=h, tile_width=w, batch_size=BATCH_SIZE
+#                 )
+
+#                 t_orig += res["orig_bytes"]
+#                 t_c_coal += res["bytes_coal"]
+#                 t_c_uncoal += res["bytes_uncoal"]
+#                 t_b_on += res["ms_base_on"]
+#                 t_b_off += res["ms_base_off"]
+#                 t_c_on += res["ms_coal_on"]
+#                 t_c_off += res["ms_coal_off"]
+#                 t_u_on += res["ms_uncoal_on"]
+#                 t_u_off += res["ms_uncoal_off"]
+
+#             r_coal = t_c_coal / t_orig
+#             r_uncoal = t_c_uncoal / t_orig
+
+#             results.append(
+#                 {
+#                     "H": h,
+#                     "W": w,
+#                     "r_coal": r_coal,
+#                     "r_uncoal": r_uncoal,
+#                     "ms_base_on": t_b_on,
+#                     "ms_base_off": t_b_off,
+#                     "ms_c_on": t_c_on,
+#                     "ms_c_off": t_c_off,
+#                     "ms_u_on": t_u_on,
+#                     "ms_u_off": t_u_off,
+#                 }
+#             )
+
+#             print(
+#                 f"| {h:>4}x{w:<4} | {r_coal:>7.3f}x | {r_uncoal:>7.3f}x | {t_b_on:>8.2f} | {t_b_off:>8.2f} | {t_c_on:>8.2f} | {t_u_on:>9.2f} | {t_c_off:>8.2f} | {t_u_off:>10.2f} |"
+#             )
+
+
+#     plot_pareto_frontier(results)
 def plot_pareto_frontier(results):
-    """
-    Plots the aggregated 10-layer results into a single IEEE-compliant panel.
-    """
+    from adjustText import adjust_text
+    import matplotlib.pyplot as plt
+    import numpy as np
+
     plt.rcParams.update(
         {
             "font.family": "serif",
             "font.size": 8,
             "axes.labelsize": 8,
-            "legend.fontsize": 8,
+            "legend.fontsize": 7,
             "xtick.labelsize": 8,
             "ytick.labelsize": 8,
         }
@@ -820,12 +1819,11 @@ def plot_pareto_frontier(results):
 
     fig, ax = plt.subplots(figsize=(3.5, 3.0))
 
-    onboard_pts = [
-        (r["ratio"], r["ms_fused_on"], f"{r['H']}x{r['W']}") for r in results
-    ]
-    offload_pts = [
-        (r["ratio"], r["ms_fused_off"], f"{r['H']}x{r['W']}") for r in results
-    ]
+    # 4 distinct configurations
+    c_on_pts = [(r["r_coal"], r["ms_c_on"], f"{r['H']}x{r['W']}") for r in results]
+    c_off_pts = [(r["r_coal"], r["ms_c_off"], f"{r['H']}x{r['W']}") for r in results]
+    u_on_pts = [(r["r_uncoal"], r["ms_u_on"], f"{r['H']}x{r['W']}") for r in results]
+    u_off_pts = [(r["r_uncoal"], r["ms_u_off"], f"{r['H']}x{r['W']}") for r in results]
 
     def get_pareto(points):
         sorted_pts = sorted(points, key=lambda x: x[0])
@@ -837,41 +1835,78 @@ def plot_pareto_frontier(results):
                 min_y = pt[1]
         return front
 
-    pareto_on = get_pareto(onboard_pts)
-    pareto_off = get_pareto(offload_pts)
+    p_c_on = get_pareto(c_on_pts)
+    p_c_off = get_pareto(c_off_pts)
+    p_u_on = get_pareto(u_on_pts)
+    p_u_off = get_pareto(u_off_pts)
 
+    # --- Added distinct `marker` shapes for accessibility ---
     # Scatters
     ax.scatter(
-        [p[0] for p in onboard_pts],
-        [p[1] for p in onboard_pts],
-        color="#82C8F0",
-        alpha=0.6,
+        [p[0] for p in c_on_pts],
+        [p[1] for p in c_on_pts],
+        color="#aec7e8",
+        alpha=0.8,
         s=15,
-        label="rANS Onboard",
+        marker="o",
+        label="Coalesced On-GPU",  # Circle
     )
     ax.scatter(
-        [p[0] for p in offload_pts],
-        [p[1] for p in offload_pts],
-        color="#F5A5C8",
-        alpha=0.6,
+        [p[0] for p in u_on_pts],
+        [p[1] for p in u_on_pts],
+        color="#1f77b4",
+        alpha=0.8,
         s=15,
-        label="rANS Offloaded",
+        marker="s",
+        label="Uncoalesced On-GPU",  # Square
+    )
+    ax.scatter(
+        [p[0] for p in c_off_pts],
+        [p[1] for p in c_off_pts],
+        color="#ff9896",
+        alpha=0.8,
+        s=15,
+        marker="^",
+        label="Coalesced Offloaded",  # Triangle
+    )
+    ax.scatter(
+        [p[0] for p in u_off_pts],
+        [p[1] for p in u_off_pts],
+        color="#d62728",
+        alpha=0.8,
+        s=15,
+        marker="D",
+        label="Uncoalesced Offloaded",  # Diamond
     )
 
     # Pareto Lines
     ax.plot(
-        [p[0] for p in pareto_on],
-        [p[1] for p in pareto_on],
-        color="#82C8F0",
-        linestyle="-",
+        [p[0] for p in p_c_on],
+        [p[1] for p in p_c_on],
+        color="#aec7e8",
+        linestyle="--",
         linewidth=1,
     )
     ax.plot(
-        [p[0] for p in pareto_off],
-        [p[1] for p in pareto_off],
-        color="#F5A5C8",
+        [p[0] for p in p_u_on],
+        [p[1] for p in p_u_on],
+        color="#1f77b4",
         linestyle="-",
+        linewidth=1.5,
+    )
+    ax.plot(
+        [p[0] for p in p_c_off],
+        [p[1] for p in p_c_off],
+        color="#ff9896",
+        linestyle="--",
         linewidth=1,
+    )
+    ax.plot(
+        [p[0] for p in p_u_off],
+        [p[1] for p in p_u_off],
+        color="#d62728",
+        linestyle="-",
+        linewidth=1.5,
     )
 
     # Baselines
@@ -880,129 +1915,246 @@ def plot_pareto_frontier(results):
 
     ax.axhline(
         avg_base_on,
-        color="#7DCDBE",
-        linestyle="--",
+        color="#2ca02c",
+        linestyle="-.",
         linewidth=1,
-        label=f"Base On ({avg_base_on:.1f}ms)",
+        label=f"Base On-GPU ({avg_base_on:.1f}ms)",
     )
     ax.axhline(
         avg_base_off,
-        color="#FFDCA5",
+        color="#ff7f0e",
         linestyle=":",
         linewidth=1.5,
-        label=f"Base Off ({avg_base_off:.1f}ms)",
+        label=f"Base Offloaded ({avg_base_off:.1f}ms)",
     )
 
-    # --- THE FIX: Collect text objects and use adjustText ---
+    # Collect texts
     texts = []
-    for pt in onboard_pts:
+    for pt in c_on_pts:
         texts.append(
             ax.text(
                 pt[0],
                 pt[1],
                 pt[2],
-                fontsize=5.5,
-                # color="#82C8F0",
-                color="#000000",
+                fontsize=4.5,
+                color="#8ab3d4",
+                ha="center",
+                va="center",
+            )
+        )
+    for pt in u_on_pts:
+        texts.append(
+            ax.text(
+                pt[0],
+                pt[1],
+                pt[2],
+                fontsize=4.5,
+                color="#1f77b4",
+                ha="center",
+                va="center",
+            )
+        )
+    for pt in c_off_pts:
+        texts.append(
+            ax.text(
+                pt[0],
+                pt[1],
+                pt[2],
+                fontsize=4.5,
+                color="#e6807e",
+                ha="center",
+                va="center",
+            )
+        )
+    for pt in u_off_pts:
+        texts.append(
+            ax.text(
+                pt[0],
+                pt[1],
+                pt[2],
+                fontsize=4.5,
+                color="#d62728",
                 ha="center",
                 va="center",
             )
         )
 
-    for pt in offload_pts:
-        texts.append(
-            ax.text(
-                pt[0],
-                pt[1],
-                pt[2],
-                fontsize=5.5,
-                # color="#F5A5C8",
-                color="#000000",
-                ha="center",
-                va="center",
-            )
-        )
+    # --- THE FIX: Format canvas AND set margins BEFORE adjust_text ---
+    ax.margins(x=0.15, y=0.15)
+
+    ax.set_xlabel("Compression Ratio (Lower is Better)", fontweight="bold")
+    ax.set_ylabel(
+        f"Aggregated Latency (ms)",
+        fontweight="bold",
+    )
+    ax.grid(True, alpha=0.25, linestyle="--")
 
     print("Repelling overlapping text labels...")
     adjust_text(
         texts,
         ax=ax,
-        arrowprops=dict(arrowstyle="-", color="gray", lw=0.3, alpha=0.6),
-        expand_points=(1.2, 1.2),
-        force_text=(0.5, 1.0),
+        arrowprops=dict(arrowstyle="-", color="gray", lw=0.2, alpha=0.5),
+        expand_points=(1.3, 1.3),
+        force_text=(0.5, 1.2),
     )
-    # --------------------------------------------------------
+    # -----------------------------------------------------------------
 
-    ax.set_xlabel("Aggregated Compression Ratio (Lower is Better)", fontweight="bold")
-    ax.set_ylabel("10-Layer Aggregated Latency (ms)", fontweight="bold")
-    ax.grid(True, alpha=0.25, linestyle="--")
+    # Manual Legend Matrix Reordering
+    handles, labels = ax.get_legend_handles_labels()
+
+    def get_handle_label(target_substr):
+        for h, l in zip(handles, labels):
+            if target_substr in l:
+                return h, l
+        return None, None
+
+    # Define our logical pairs (Left Column vs Right Column)
+    row1 = [get_handle_label("Base On-GPU"), get_handle_label("Base Offloaded")]
+    row2 = [
+        get_handle_label("Coalesced On-GPU"),
+        get_handle_label("Uncoalesced On-GPU"),
+    ]
+    row3 = [
+        get_handle_label("Coalesced Offloaded"),
+        get_handle_label("Uncoalesced Offloaded"),
+    ]
+
+    # Matplotlib's ncol=2 draws column 1 first, then column 2.
+    col1_handles = [row1[0][0], row2[0][0], row3[0][0]]
+    col1_labels = [row1[0][1], row2[0][1], row3[0][1]]
+
+    col2_handles = [row1[1][0], row2[1][0], row3[1][0]]
+    col2_labels = [row1[1][1], row2[1][1], row3[1][1]]
+
+    ordered_handles = col1_handles + col2_handles
+    ordered_labels = col1_labels + col2_labels
 
     ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.25),
+        ordered_handles,
+        ordered_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
         ncol=2,
         frameon=False,
         columnspacing=0.8,
+        handletextpad=0.4,
     )
-    plt.subplots_adjust(top=0.78, bottom=0.15, left=0.15, right=0.98)
 
-    plt.savefig("rans_pareto_10_layers_ieee.pdf", format="pdf", dpi=300)
+    plt.savefig("rans_pareto_4way_ieee.pdf", format="pdf", dpi=300, bbox_inches="tight")
     print(
-        "\n✅ Saved IEEE-formatted Aggregate Pareto plot to 'rans_pareto_10_layers_ieee.pdf'"
+        "\n✅ Saved IEEE-formatted, accessible Aggregate Pareto plot to 'rans_pareto_4way_ieee.pdf'"
     )
+    plt.close()
 
+
+import json
+import argparse
+from datetime import datetime
+import matplotlib.pyplot as plt
+import numpy as np
 
 if __name__ == "__main__":
-    MODEL_PATH = "Qwen/Qwen3-14B"
-    heights = [256, 512, 1024, 2048, 4096]
-    widths = [32, 64, 128, 256]
-    BATCH_SIZE = 1
-    NUM_LAYERS = 15
+    parser = argparse.ArgumentParser(description="Optimal Tile Size Ablation Study")
+    parser.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Path to JSON file with precomputed results",
+    )
+    args = parser.parse_args()
 
-    print(f"\nStarting 10-Layer Ablation Study | Batch Size: {BATCH_SIZE}")
+    if args.file:
+        with open(args.file, "r") as f:
+            results = json.load(f)
+        print(f"Loaded results from {args.file}. Plotting Pareto frontier...")
+        plot_pareto_frontier(results)
+        exit(0)
+
+    import torch
+    import triton
+    import os
+    from safetensors import safe_open
+    from huggingface_hub import snapshot_download
+
+    # --- Import your custom modules here ---
+    from comp_inference import (
+        rans_compress_module_weight,
+        fused_rans_linear_triton,
+        fused_rans_linear_triton_uncoalesced,
+    )
+
+    MODEL_PATH = "Qwen/Qwen3-14B"  # Consider testing with 0.5B first!
+    heights = [256, 512, 1024]
+    widths = [32, 64, 128]
+    BATCH_SIZE = 1
+    NUM_LAYERS = None  # None means run ALL compressible layers
+
+    print(f"\nStarting Full Model Ablation Study | Batch Size: {BATCH_SIZE}")
     real_weights = get_compressible_layers(MODEL_PATH, num_layers=NUM_LAYERS)
 
     results = []
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = time_stamp + "_test_optimal_results.json"
 
-    print("-" * 110)
+    print("-" * 135)
     print(
-        f"| {'Tile':^10} | {'Ratio':^7} | {'Base On (ms)':^12} | {'Base Off (ms)':^13} | {'rANS On (ms)':^12} | {'rANS Off (ms)':^13} |"
+        f"| {'Tile':^10} | {'Rat Coal':^8} | {'Rat Unc':^8} | {'Base On':^8} | {'Base Off':^8} | {'Coal On':^8} | {'Uncoal On':^9} | {'Coal Off':^8} | {'Uncoal Off':^10} |"
     )
-    print("-" * 110)
+    print("-" * 135)
 
     for h in heights:
         for w in widths:
-            tot_orig = (
-                tot_comp
-            ) = tot_base_on = tot_base_off = tot_fused_on = tot_fused_off = 0.0
+            (
+                t_orig,
+                t_c_coal,
+                t_c_uncoal,
+                t_b_on,
+                t_b_off,
+                t_c_on,
+                t_c_off,
+                t_u_on,
+                t_u_off,
+            ) = (0.0,) * 9
 
             for name, weight_tensor in real_weights.items():
                 res = test_single_matrix(
                     weight_tensor, tile_height=h, tile_width=w, batch_size=BATCH_SIZE
                 )
-                tot_orig += res["orig_bytes"]
-                tot_comp += res["comp_bytes"]
-                tot_base_on += res["ms_base_on"]
-                tot_base_off += res["ms_base_off"]
-                tot_fused_on += res["ms_fused_on"]
-                tot_fused_off += res["ms_fused_off"]
 
-            ratio = tot_comp / tot_orig
+                t_orig += res["orig_bytes"]
+                t_c_coal += res["bytes_coal"]
+                t_c_uncoal += res["bytes_uncoal"]
+                t_b_on += res["ms_base_on"]
+                t_b_off += res["ms_base_off"]
+                t_c_on += res["ms_coal_on"]
+                t_c_off += res["ms_coal_off"]
+                t_u_on += res["ms_uncoal_on"]
+                t_u_off += res["ms_uncoal_off"]
 
-            results.append(
-                {
-                    "H": h,
-                    "W": w,
-                    "ratio": ratio,
-                    "ms_base_on": tot_base_on,
-                    "ms_base_off": tot_base_off,
-                    "ms_fused_on": tot_fused_on,
-                    "ms_fused_off": tot_fused_off,
-                }
-            )
+            r_coal = t_c_coal / t_orig
+            r_uncoal = t_c_uncoal / t_orig
+
+            res_dict = {
+                "H": h,
+                "W": w,
+                "r_coal": r_coal,
+                "r_uncoal": r_uncoal,
+                "ms_base_on": t_b_on,
+                "ms_base_off": t_b_off,
+                "ms_c_on": t_c_on,
+                "ms_c_off": t_c_off,
+                "ms_u_on": t_u_on,
+                "ms_u_off": t_u_off,
+            }
+            results.append(res_dict)
 
             print(
-                f"| {h:>4}x{w:<4} | {ratio:^7.3f}x | {tot_base_on:^12.2f} | {tot_base_off:^13.2f} | {tot_fused_on:^12.2f} | {tot_fused_off:^13.2f} |"
+                f"| {h:>4}x{w:<4} | {r_coal:>7.3f}x | {r_uncoal:>7.3f}x | {t_b_on:>8.2f} | {t_b_off:>8.2f} | {t_c_on:>8.2f} | {t_u_on:>9.2f} | {t_c_off:>8.2f} | {t_u_off:>10.2f} |"
             )
 
+            # --- SAFETY SAVE: Checkpoint to JSON after every completed configuration ---
+            with open(output_file, "w") as f:
+                json.dump(results, f, indent=4)
+
+    print(f"\n✅ Benchmarking complete! Data safely written to {output_file}.")
     plot_pareto_frontier(results)

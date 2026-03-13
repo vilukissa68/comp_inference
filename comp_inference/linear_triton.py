@@ -1034,3 +1034,232 @@ def fused_rans_matmul_kernel_splitk(
         acc_bf16,
         mask=m_valid[:, None] & n_valid[None, :],
     )
+
+
+import triton
+import triton.language as tl
+import torch
+
+
+@triton.jit
+def fused_rans_matmul_kernel_uncoalesced_splitk(
+    x_ptr,
+    compressed_data,
+    stream_offsets,  # NEW: Absolute byte offset for each stream
+    stream_sizes,  # NEW: Exact byte length of each stream
+    initial_states,
+    mantissas_ptr,
+    workspace_ptr,
+    slot_map,
+    tables,
+    M,
+    N,
+    K,
+    num_tiles_n,
+    num_tiles_k,
+    stride_am,
+    stride_ak,
+    stride_wk,
+    stride_wm,
+    stride_wn,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    PROB_BITS: tl.constexpr,
+    PROB_MASK: tl.constexpr,
+    RANS_L: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    lane_id = tl.arange(0, TILE_N)
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+
+    global_n = pid_n * TILE_N + lane_id
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+
+    n_valid = global_n < N
+    m_valid = offs_m < M
+    x_row_ptrs = x_ptr + offs_m[:, None] * stride_am
+
+    # --- SPLIT-K LOGIC: Calculate which K-tiles this specific block owns ---
+    total_k_tiles = tl.cdiv(K, TILE_K)
+    tiles_per_split = tl.cdiv(total_k_tiles, SPLIT_K)
+
+    start_k_tile = pid_k * tiles_per_split
+    end_k_tile = tl.minimum(start_k_tile + tiles_per_split, total_k_tiles)
+
+    # ONLY loop through this block's assigned tiles!
+    for k_tile_idx in range(start_k_tile, end_k_tile):
+        tile_id = k_tile_idx * num_tiles_n + pid_n
+
+        # In Dense Packing, each thread has its own independent stream
+        stream_id = tile_id * TILE_N + lane_id
+
+        # Look up the specific offset and size for each thread's stream
+        stream_offset = tl.load(stream_offsets + stream_id).to(tl.int64)
+        stream_size = tl.load(stream_sizes + stream_id).to(tl.int64)
+        state = tl.load(initial_states + stream_id).to(tl.uint32)
+
+        # Initialize the backward read pointer exactly at the end of each stream
+        current_byte_idx = stream_size - 1
+
+        local_acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+        tile_man_base = tile_id * TILE_K * TILE_N
+
+        # --- COMPUTE LOOP ---
+        for bk_start in range(0, TILE_K, BLOCK_K):
+            k_base = k_tile_idx * TILE_K + bk_start
+            x_col_ptrs = x_row_ptrs + k_base * stride_ak
+            man_ptrs = mantissas_ptr + tile_man_base + (bk_start * TILE_N) + lane_id
+
+            for i in range(BLOCK_K):
+                k_in_bounds = (k_base + i) < K
+                mask_n = k_in_bounds & n_valid
+                mask_m = k_in_bounds & m_valid[:, None]
+
+                # 1. INDEPENDENT MEMORY FETCHES
+                x_col = tl.load(x_col_ptrs, mask=mask_m, other=0.0).to(tl.bfloat16)
+                x_col_ptrs += stride_ak
+
+                raw_man = tl.load(man_ptrs, mask=mask_n, other=0).to(tl.uint16)
+                man_ptrs += TILE_N
+
+                # 2. STATE LOOKUPS
+                slot = state & PROB_MASK
+                exp_sym = tl.load(slot_map + slot, mask=mask_n, other=0).to(tl.uint16)
+
+                # 3. WEIGHT RECONSTRUCTION & ACCUMULATION
+                w_int = ((raw_man & 0x80) << 8) | (exp_sym << 7) | (raw_man & 0x7F)
+                w_val = w_int.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+                local_acc += (x_col * w_val[None, :]).to(tl.float32)
+
+                # 4. STATE UPDATES
+                packed = tl.load(tables + exp_sym, mask=mask_n, other=0)
+                state = (packed & 0xFFFF) * (state >> PROB_BITS) + (
+                    slot - (packed >> 16)
+                )
+
+                # 5. RENORMALIZATION (Uncoalesced, sequential reads)
+                needs_renorm_1 = (state < RANS_L) & mask_n & (current_byte_idx >= 0)
+                ptr_1 = (
+                    compressed_data + stream_offset + tl.maximum(current_byte_idx, 0)
+                )
+                state = tl.where(
+                    needs_renorm_1,
+                    (state << 8)
+                    | tl.load(ptr_1, mask=needs_renorm_1, other=0).to(tl.uint32),
+                    state,
+                )
+                current_byte_idx -= tl.where(needs_renorm_1, 1, 0)
+
+                needs_renorm_2 = (state < RANS_L) & mask_n & (current_byte_idx >= 0)
+                ptr_2 = (
+                    compressed_data + stream_offset + tl.maximum(current_byte_idx, 0)
+                )
+                state = tl.where(
+                    needs_renorm_2,
+                    (state << 8)
+                    | tl.load(ptr_2, mask=needs_renorm_2, other=0).to(tl.uint32),
+                    state,
+                )
+                current_byte_idx -= tl.where(needs_renorm_2, 1, 0)
+
+        acc += local_acc
+
+    # --- SPLIT-K WRITEBACK ---
+    acc_bf16 = acc.to(tl.bfloat16)
+    workspace_offset = (
+        (pid_k.to(tl.int64) * stride_wk)
+        + (offs_m[:, None].to(tl.int64) * stride_wm)
+        + (global_n[None, :].to(tl.int64) * stride_wn)
+    )
+
+    tl.store(
+        workspace_ptr + workspace_offset,
+        acc_bf16,
+        mask=m_valid[:, None] & n_valid[None, :],
+    )
+
+
+def fused_rans_linear_triton_uncoalesced(
+    x,
+    compressed_data,
+    initial_states,
+    tables,
+    slot_map,
+    weight_shape,
+    stream_offsets,  # Updated parameter name
+    stream_sizes,  # Updated parameter name
+    tile_k,
+    tile_n,
+    mantissas,
+    accum_block_size=32,
+    bias=None,
+    out=None,
+    SPLIT_K=8,
+    workspace=None,
+):
+    K, N = weight_shape
+
+    x_flat = x.view(-1, K)
+    M_input = x_flat.shape[0]
+
+    TILES_N = (N + tile_n - 1) // tile_n
+    TILES_K = (K + tile_k - 1) // tile_k
+
+    if workspace is None:
+        workspace = torch.empty(
+            (SPLIT_K, M_input, N), dtype=torch.bfloat16, device=x.device
+        )
+    else:
+        workspace = workspace.view(SPLIT_K, M_input, N)
+
+    TILE_M = 16
+
+    grid = (triton.cdiv(M_input, TILE_M), triton.cdiv(N, tile_n), SPLIT_K)
+
+    fused_rans_matmul_kernel_uncoalesced_splitk[grid](
+        x_flat,
+        compressed_data,
+        stream_offsets,
+        stream_sizes,
+        initial_states,
+        mantissas,
+        workspace,
+        slot_map,
+        tables,
+        M_input,
+        N,
+        K,
+        TILES_N,
+        TILES_K,
+        x_flat.stride(0),
+        x_flat.stride(1),
+        workspace.stride(0),
+        workspace.stride(1),
+        workspace.stride(2),
+        TILE_M=TILE_M,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        BLOCK_K=accum_block_size,
+        PROB_BITS=12,
+        PROB_MASK=4095,
+        RANS_L=1 << 16,
+        SPLIT_K=SPLIT_K,
+    )
+
+    if out is not None:
+        torch.sum(workspace, dim=0, out=out)
+        if bias is not None:
+            out += bias
+        return out
+    else:
+        final_output = torch.sum(workspace, dim=0)
+        if bias is not None:
+            final_output += bias
+        return final_output.view(*x.shape[:-1], N)
